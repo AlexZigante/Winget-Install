@@ -1,22 +1,33 @@
 #Change app to detect [Application ID]
 $AppToDetect = "Notepad++.Notepad++"
 
+<#
+  Alex edition - Improved WinGet detection for Intune
 
-<# FUNCTIONS #>
+  Exit codes:
+    0 = App detected AND no upgrade available
+    1 = App not detected OR upgrade available OR detection error
 
-Function Get-WingetCmd {
+  Logging:
+    - Writes to C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\MyWinGet\Detect_<AppId>.log
+    - Also writes to console so messages appear in AppWorkload.log
+#>
+
+function Get-WingetCmd {
 
     $WingetCmd = $null
 
-    #Get WinGet Path
     try {
-        #Get Admin Context Winget Location
-        $WingetInfo = (Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe").VersionInfo | Sort-Object -Property FileVersionRaw
-        #If multiple versions, pick most recent one
-        $WingetCmd = $WingetInfo[-1].FileName
+        # Admin context
+        $WingetInfo = Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe" -ErrorAction Stop |
+            Select-Object -ExpandProperty VersionInfo |
+            Sort-Object -Property FileVersionRaw
+        if ($WingetInfo) {
+            $WingetCmd = $WingetInfo[-1].FileName
+        }
     }
     catch {
-        #Get User context Winget Location
+        # User context
         if (Test-Path "$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe") {
             $WingetCmd = "$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe"
         }
@@ -25,29 +36,87 @@ Function Get-WingetCmd {
     return $WingetCmd
 }
 
-<# MAIN #>
+function Get-MyWinGetDetectLogFile {
+    param(
+        [Parameter(Mandatory)]
+        [string] $AppId
+    )
 
-#Get WinGet Location Function
-$winget = Get-WingetCmd
+    $root = Join-Path -Path $env:ProgramData -ChildPath "Microsoft\IntuneManagementExtension\Logs\MyWinGet"
+    if (-not (Test-Path $root)) {
+        New-Item -Path $root -ItemType Directory -Force | Out-Null
+    }
 
-#Set json export file
-$JsonFile = "$env:TEMP\InstalledApps.json"
+    $safeId = ($AppId -replace '[^\w\.-]', '_')
+    return Join-Path -Path $root -ChildPath ("Detect_{0}.log" -f $safeId)
+}
 
-#Get installed apps and version in json file
-& $Winget export -o $JsonFile --accept-source-agreements | Out-Null
+function Write-DetectLog {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Message
+    )
 
-#Get json content
-$Json = Get-Content $JsonFile -Raw | ConvertFrom-Json
+    $timestamp = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $line = "{0} [DETECT] [{1}] {2}" -f $timestamp, $global:DetectAppId, $Message
 
-#Get apps and version in hashtable
-$Packages = $Json.Sources.Packages
+    # Console (for AppWorkload.log)
+    Write-Host $line
 
-#Remove json file
-Remove-Item $JsonFile -Force
+    # File
+    if ($global:DetectLogFile) {
+        Add-Content -Path $global:DetectLogFile -Value $line
+    }
+}
 
-# Search for specific app and version
-$Apps = $Packages | Where-Object { $_.PackageIdentifier -eq $AppToDetect }
+$global:DetectAppId = $AppToDetect
+$global:DetectLogFile = Get-MyWinGetDetectLogFile -AppId $AppToDetect
 
-if ($Apps) {
-    return "Installed!"
+try {
+    $winget = Get-WingetCmd
+    if (-not $winget) {
+        Write-DetectLog "winget.exe not found. Cannot detect $AppToDetect."
+        exit 1
+    }
+
+    Write-DetectLog "Using winget at: $winget"
+    Write-DetectLog "Running detection for: $AppToDetect"
+
+    # 1) Is app installed?
+    Write-DetectLog "Executing: winget list --id $AppToDetect --exact"
+    $listOutput = & $winget list --id $AppToDetect --exact 2>&1
+    $listOutput | ForEach-Object { Write-DetectLog $_ }
+
+    if ($LASTEXITCODE -ne 0 -or -not $listOutput) {
+        Write-DetectLog "winget list failed or returned no output. ExitCode=$LASTEXITCODE"
+        exit 1
+    }
+
+    $installedLine = $listOutput | Select-String -SimpleMatch $AppToDetect | Select-Object -First 1
+    if (-not $installedLine) {
+        Write-DetectLog "$AppToDetect not found in winget list output."
+        exit 1
+    }
+
+    Write-DetectLog "$AppToDetect appears installed. Checking for upgrades..."
+
+    # 2) Is an upgrade available?
+    Write-DetectLog "Executing: winget upgrade --id $AppToDetect --exact"
+    $upgradeOutput = & $winget upgrade --id $AppToDetect --exact 2>&1
+    $upgradeOutput | ForEach-Object { Write-DetectLog $_ }
+
+    if ($LASTEXITCODE -eq 0 -and ($upgradeOutput | Select-String -SimpleMatch $AppToDetect)) {
+        Write-DetectLog "$AppToDetect is installed, but an upgrade is available."
+        exit 1
+    }
+
+    Write-DetectLog "$AppToDetect is installed and up to date."
+    exit 0
+}
+catch {
+    Write-DetectLog ("Detection error: {0}" -f $_.Exception.Message)
+    if ($_.InvocationInfo) {
+        Write-DetectLog $_.InvocationInfo.PositionMessage
+    }
+    exit 1
 }

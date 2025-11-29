@@ -52,6 +52,13 @@ param(
 )
 
 
+
+
+# === Alex edition: global exit code for Intune ===
+if (-not $Global:WingetInstallExitCode) {
+    $Global:WingetInstallExitCode = 0
+}
+
 <# FUNCTIONS #>
 
 #Log Function
@@ -63,6 +70,53 @@ function Write-ToLog ($LogMsg, $LogColor = "White") {
     #Write log to file
     $Log | out-file -filepath $LogFile -Append
 }
+
+function Update-GlobalExitCode {
+    param(
+        [Parameter(Mandatory)]
+        [int] $RawCode,
+
+        [Parameter(Mandatory)]
+        [string] $AppID,
+
+        [Parameter(Mandatory)]
+        [ValidateSet("Install","Uninstall")]
+        [string] $Phase
+    )
+
+    $description = switch ($RawCode) {
+        0      { "Success" }
+        1707   { "Success (No action required)" }
+        3010   { "Success (Soft reboot required)" }
+        1641   { "Success (Hard reboot required)" }
+        1618   { "Another installation is already in progress" }
+        1603   { "Fatal error during installation" }
+        1619   { "Could not open installation package" }
+        1620   { "Invalid installer package" }
+        1638   { "Another version of this product is already installed" }
+        default {
+            if ($RawCode -lt 0) {
+                "WinGet internal error (see WinGet logs)"
+            }
+            else {
+                "Unknown error"
+            }
+        }
+    }
+
+    # For Intune dashboards, we keep the raw code so it can be mapped there.
+    $mapped = $RawCode
+
+    Write-ToLog ("[{0}][{1}] Installer exit code: {2} ({3}). Intune return code: {4}" -f $Phase, $AppID, $RawCode, $description, $mapped) "Yellow"
+    Write-ToLog ("##WINGETINSTALL_SUMMARY;AppId={0};Phase={1};RawExit={2};MappedExit={3};Description={4}" -f $AppID, $Phase, $RawCode, $mapped, $description) "Yellow"
+
+    if ($mapped -ne 0 -and $Global:WingetInstallExitCode -eq 0) {
+        $Global:WingetInstallExitCode = $mapped
+    }
+
+    return $mapped
+}
+
 
 #Get WinGet Location Function
 function Get-WingetCmd {
@@ -310,6 +364,7 @@ function Test-ModsUninstall ($AppID) {
 function Install-App ($AppID, $AppArgs) {
     $IsInstalled = Confirm-Install $AppID
     if (!($IsInstalled) -or $AllowUpgrade ) {
+
         #Check if mods exist (or already exist) for preinstall/install/installedonce/installed
         $ModsPreInstall, $ModsInstall, $ModsInstalledOnce, $ModsInstalled = Test-ModsInstall $($AppID)
 
@@ -321,32 +376,66 @@ function Install-App ($AppID, $AppArgs) {
 
         #Install App
         Write-ToLog "-> Installing $AppID..." "Yellow"
-        $WingetArgs = "install --id $AppID -e --accept-package-agreements --accept-source-agreements -s winget -h $AppArgs" -split " "
-        Write-ToLog "-> Running: `"$Winget`" $WingetArgs"
-        & "$Winget" $WingetArgs | Where-Object { $_ -notlike "   *" } | Tee-Object -file $LogFile -Append
 
+        # Build modern WinGet arguments
+        $WingetArgs = @(
+            "install"
+            "--id", $AppID
+            "-e"
+            "--accept-package-agreements"
+            "--accept-source-agreements"
+            "--scope", "machine"
+            "--disable-interactivity"
+            "-s", "winget"
+            "-h"
+        )
+
+        if ($AppArgs) {
+            $WingetArgs += $AppArgs.Split(" ")
+        }
+
+        Write-ToLog ("-> Running: `"{0}`" {1}" -f $Winget, ($WingetArgs -join " ")) "Yellow"
+
+        $output = & "$Winget" $WingetArgs 2>&1
+        $output | Where-Object { $_ -notlike "   *" } | Tee-Object -FilePath $LogFile -Append | ForEach-Object {
+            Write-ToLog $_
+        }
+
+        $exit = $LASTEXITCODE
+        Update-GlobalExitCode -RawCode $exit -AppID $AppID -Phase "Install"
+
+        #If Install script exist
         if ($ModsInstall) {
             Write-ToLog "-> Modifications for $AppID during install are being applied..." "Yellow"
             & "$ModsInstall"
         }
 
-        #Check if install is ok
+        #Check if install complete
         $IsInstalled = Confirm-Install $AppID
         if ($IsInstalled) {
-            Write-ToLog "-> $AppID successfully installed." "Green"
+            Write-ToLog "-> $AppID installation succeeded!" "Green"
 
+            #If InstalledOnce script exist
             if ($ModsInstalledOnce) {
-                Write-ToLog "-> Modifications for $AppID after install (one time) are being applied..." "Yellow"
-                & "$ModsInstalledOnce"
+                $Key = Test-InstalledOnce $($AppID)
+                if (!($Key)) {
+                    Write-ToLog "-> Modifications for $AppID in ""InstalledOnce"" are being applied..." "Yellow"
+                    & "$ModsInstalledOnce"
+
+                    if (Test-Path "HKLM:\SOFTWARE\Winget-Install") {
+                        New-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Winget-Install" -Name $AppID -PropertyType String -Value "Installed" -Force | Out-Null
+                    }
+                    else {
+                        New-Item -Path "HKLM:\SOFTWARE\Winget-Install" -ItemType Directory -Force | Out-Null
+                        New-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Winget-Install" -Name $AppID -PropertyType String -Value "Installed" -Force | Out-Null
+                    }
+                }
             }
-            elseif ($ModsInstalled) {
+
+            #If Installed script exist
+            if ($ModsInstalled) {
                 Write-ToLog "-> Modifications for $AppID after install are being applied..." "Yellow"
                 & "$ModsInstalled"
-            }
-
-            #Add mods if deployed from Winget-Install
-            if ((Test-Path "$PSScriptRoot\mods\$AppID-preinstall.ps1") -or (Test-Path "$PSScriptRoot\mods\$AppID-upgrade.ps1") -or (Test-Path "$PSScriptRoot\mods\$AppID-install.ps1") -or (Test-Path "$PSScriptRoot\mods\$AppID-installed.ps1")) {
-                Add-WAUMods $AppID
             }
 
             #Add to WAU White List if set
@@ -363,6 +452,7 @@ function Install-App ($AppID, $AppArgs) {
     }
 }
 
+
 #Uninstall function
 function Uninstall-App ($AppID, $AppArgs) {
     $IsInstalled = Confirm-Install $AppID
@@ -378,42 +468,56 @@ function Uninstall-App ($AppID, $AppArgs) {
 
         #Uninstall App
         Write-ToLog "-> Uninstalling $AppID..." "Yellow"
-        $WingetArgs = "uninstall --id $AppID -e --accept-source-agreements -h" -split " "
-        Write-ToLog "-> Running: `"$Winget`" $WingetArgs"
-        & "$Winget" $WingetArgs | Where-Object { $_ -notlike "   *" } | Tee-Object -file $LogFile -Append
 
+        $WingetArgs = @(
+            "uninstall"
+            "--id", $AppID
+            "-e"
+            "--accept-source-agreements"
+            "--disable-interactivity"
+            "-h"
+        )
+
+        if ($AppArgs) {
+            $WingetArgs += $AppArgs.Split(" ")
+        }
+
+        Write-ToLog ("-> Running: `"{0}`" {1}" -f $Winget, ($WingetArgs -join " ")) "Yellow"
+
+        $output = & "$Winget" $WingetArgs 2>&1
+        $output | Where-Object { $_ -notlike "   *" } | Tee-Object -FilePath $LogFile -Append | ForEach-Object {
+            Write-ToLog $_
+        }
+
+        $exit = $LASTEXITCODE
+        Update-GlobalExitCode -RawCode $exit -AppID $AppID -Phase "Uninstall"
+
+        #If Uninstall script exist
         if ($ModsUninstall) {
             Write-ToLog "-> Modifications for $AppID during uninstall are being applied..." "Yellow"
             & "$ModsUninstall"
         }
 
-        #Check if uninstall is ok
+        #Check if uninstall complete
         $IsInstalled = Confirm-Install $AppID
         if (!($IsInstalled)) {
-            Write-ToLog "-> $AppID successfully uninstalled." "Green"
+            Write-ToLog "-> $AppID was successfully uninstalled!" "Green"
+
+            #If Uninstalled script exist
             if ($ModsUninstalled) {
                 Write-ToLog "-> Modifications for $AppID after uninstall are being applied..." "Yellow"
                 & "$ModsUninstalled"
             }
-
-            #Remove mods if deployed from Winget-Install
-            if ((Test-Path "$PSScriptRoot\mods\$AppID-preinstall.ps1") -or (Test-Path "$PSScriptRoot\mods\$AppID-upgrade.ps1") -or (Test-Path "$PSScriptRoot\mods\$AppID-install.ps1") -or (Test-Path "$PSScriptRoot\mods\$AppID-installed.ps1")) {
-                Remove-WAUMods $AppID
-            }
-
-            #Remove from WAU White List if set
-            if ($WAUWhiteList) {
-                Remove-WAUWhiteList $AppID
-            }
         }
         else {
-            Write-ToLog "-> $AppID uninstall failed!" "Red"
+            Write-ToLog "-> $AppID uninstallation failed!" "Red"
         }
     }
     else {
         Write-ToLog "-> $AppID is not installed." "Cyan"
     }
 }
+
 
 #Function to Add app to WAU white list
 function Add-WAUWhiteList ($AppID) {
@@ -587,3 +691,10 @@ if ($Winget) {
 
 Write-ToLog "###   END REQUEST   ###`n" "Magenta"
 Start-Sleep 3
+
+if (-not $Global:WingetInstallExitCode) {
+    $Global:WingetInstallExitCode = 0
+}
+
+exit $Global:WingetInstallExitCode
+
