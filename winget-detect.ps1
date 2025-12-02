@@ -1,5 +1,15 @@
-# Winget Detect - WIP v2 (Intune custom detection script)
+# Winget Detect - WIP v4 (Intune custom detection script)
 $AppToDetect = "PLACEHOLDER"
+
+# Detection internal result codes (for logs only)
+# 2000 : Unknown detection error
+# 2001 : winget.exe not found
+# 2002 : 'winget list' failed
+# 2003 : App not present in 'winget list' (not installed)
+# 2004 : 'winget upgrade' indicates an update available (not compliant)
+# 2005 : Installed & up to date (detected)
+
+$DetectionResultCode = 0
 
 # Logs under Intune Management Extension tree, per app
 $logDirName = $AppToDetect -replace '[^\w\.-]', '_'
@@ -26,136 +36,92 @@ function Write-Log {
     Write-Host $line
 }
 
-# BurntToast helpers for detection as well (best-effort)
-$script:BurntToastAvailable = $false
-$script:BurntToastInstalledThisRun = $false
-
-function Initialize-Toast {
-    if ($script:BurntToastAvailable) { return }
-
+function Get-WingetPath {
     try {
-        $installed = Get-Module -ListAvailable BurntToast | Select-Object -First 1
-        if (-not $installed) {
-            Write-Log "BurntToast not found. Installing from PSGallery..." "INFO"
-
-            if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-                Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -ErrorAction Stop | Out-Null
-            }
-
-            if (-not (Get-PSRepository -Name "PSGallery" -ErrorAction SilentlyContinue)) {
-                Register-PSRepository -Default -ErrorAction Stop
-            }
-
-            $params = @{
-                Name         = 'BurntToast'
-                Force        = $true
-                Scope        = 'CurrentUser'
-                AllowClobber = $true
-            }
-            Install-Module @params -ErrorAction Stop | Out-Null
-            $script:BurntToastInstalledThisRun = $true
-        }
-
-        Import-Module BurntToast -Force -ErrorAction Stop
-        $script:BurntToastAvailable = $true
-        Write-Log "BurntToast module loaded for detection." "INFO"
+        $cmd = Get-Command winget.exe -ErrorAction Stop
+        return $cmd.Source
     }
     catch {
-        Write-Log "BurntToast not available for detection: $($_.Exception.Message)" "WARN"
-        $script:BurntToastAvailable = $false
-    }
-}
-
-function Cleanup-ToastModule {
-    try {
-        if ($script:BurntToastAvailable) {
-            Remove-Module BurntToast -ErrorAction SilentlyContinue
+        Write-Log "winget.exe not in PATH, searching Program Files\WindowsApps..." "WARN"
+        $candidates = Get-ChildItem "C:\Program Files\WindowsApps" -Recurse -Filter winget.exe -ErrorAction SilentlyContinue
+        if ($candidates -and $candidates.Count -gt 0) {
+            $path = $candidates[0].FullName
+            Write-Log "Found winget.exe at '$path'." "INFO"
+            return $path
         }
-        if ($script:BurntToastInstalledThisRun) {
-            Uninstall-Module -Name BurntToast -AllVersions -Force -ErrorAction SilentlyContinue
-        }
-    }
-    catch {}
-}
-
-function Show-DetectToast {
-    param(
-        [string]$Status,
-        [string]$Message
-    )
-
-    if (-not $script:BurntToastAvailable) { return }
-
-    try {
-        $title = "WinGet Intune - Detect"
-        $body  = "$Status - $Message"
-        New-BurntToastNotification -Text $title, $body | Out-Null
-    }
-    catch {
-        Write-Log "Failed to show BurntToast detection notification: $($_.Exception.Message)" "WARN"
+        throw
     }
 }
 
-Initialize-Toast
 Write-Log "Starting detection for '$AppToDetect'."
-Show-DetectToast -Status "Start" -Message "Checking $AppToDetect..."
 
-# Locate winget
 try {
-    $winget = (Get-Command winget.exe -ErrorAction Stop).Source
-    Write-Log "Using winget at '$winget'."
+    # Locate winget
+    try {
+        $winget = Get-WingetPath
+        Write-Log "Using winget at '$winget'."
+    }
+    catch {
+        Write-Log "winget.exe not found: $($_.Exception.Message)" "ERROR"
+        $DetectionResultCode = 2001
+        throw
+    }
+
+    # Check if app is installed, based on 'winget list'
+    try {
+        $listOut = & $winget list --id $AppToDetect -e --accept-source-agreements 2>&1
+        $listExit = $LASTEXITCODE
+        Write-Log "'winget list' exit code: $listExit"
+        Write-Log ("'winget list' output:`n{0}" -f (($listOut | Out-String).Trim()))
+    }
+    catch {
+        Write-Log "Error running 'winget list': $($_.Exception.Message)" "ERROR"
+        $DetectionResultCode = 2002
+        throw
+    }
+
+    if (-not $listOut -or ($listOut | Out-String) -notmatch [regex]::Escape($AppToDetect)) {
+        Write-Log "'$AppToDetect' not present in 'winget list' → NOT INSTALLED."
+        $DetectionResultCode = 2003
+        $global:LASTEXITCODE = 1
+        "NotDetected: Code 2003"
+        exit 1
+    }
+
+    # Optional: treat available upgrade as non-compliant
+    try {
+        $upgOut = & $winget upgrade --id $AppToDetect -e --accept-source-agreements 2>&1
+        $upgExit = $LASTEXITCODE
+        Write-Log "'winget upgrade' exit code: $upgExit"
+        Write-Log ("'winget upgrade' output:`n{0}" -f (($upgOut | Out-String).Trim()))
+    }
+    catch {
+        Write-Log "Error running 'winget upgrade': $($_.Exception.Message)" "WARN"
+        $upgOut = $null
+    }
+
+    if ($upgOut -and ($upgOut | Out-String) -match [regex]::Escape($AppToDetect)) {
+        Write-Log "'$AppToDetect' is installed but an UPGRADE is available → NOT COMPLIANT."
+        $DetectionResultCode = 2004
+        $global:LASTEXITCODE = 1
+        "NotDetected: Code 2004"
+        exit 1
+    }
+
+    Write-Log "'$AppToDetect' installed and up to date → DETECTED."
+    $DetectionResultCode = 2005
+
+    # Intune custom detection script expects exit code 0 AND something on STDOUT for "installed"
+    "Detected: Code 2005"
+    $global:LASTEXITCODE = 0
+    exit 0
 }
 catch {
-    Write-Log "winget.exe not found: $($_.Exception.Message)" "ERROR"
-    Show-DetectToast -Status "Error" -Message "winget.exe not found."
-    Cleanup-ToastModule
+    if ($DetectionResultCode -eq 0) {
+        $DetectionResultCode = 2000
+    }
+    Write-Log "Detection fatal error (code $DetectionResultCode): $($_.Exception.Message)" "ERROR"
+    $global:LASTEXITCODE = 1
+    "NotDetected: Code $DetectionResultCode"
     exit 1
 }
-
-# Check if app is installed, based on 'winget list'
-try {
-    $listOut = & $winget list --id $AppToDetect -e --accept-source-agreements 2>&1
-    $listExit = $LASTEXITCODE
-    Write-Log "'winget list' exit code: $listExit"
-    Write-Log ("'winget list' output:`n{0}" -f (($listOut | Out-String).Trim()))
-}
-catch {
-    Write-Log "Error running 'winget list': $($_.Exception.Message)" "ERROR"
-    Show-DetectToast -Status "Error" -Message "Failed to run 'winget list'."
-    Cleanup-ToastModule
-    exit 1
-}
-
-if (-not $listOut -or ($listOut | Out-String) -notmatch [regex]::Escape($AppToDetect)) {
-    Write-Log "'$AppToDetect' not present in 'winget list' → NOT INSTALLED (exit 1)."
-    Show-DetectToast -Status "Not installed" -Message "$AppToDetect not found."
-    Cleanup-ToastModule
-    exit 1
-}
-
-# Optional: treat available upgrade as non-compliant
-try {
-    $upgOut = & $winget upgrade --id $AppToDetect -e --accept-source-agreements 2>&1
-    $upgExit = $LASTEXITCODE
-    Write-Log "'winget upgrade' exit code: $upgExit"
-    Write-Log ("'winget upgrade' output:`n{0}" -f (($upgOut | Out-String).Trim()))
-}
-catch {
-    Write-Log "Error running 'winget upgrade': $($_.Exception.Message)" "WARN"
-    $upgOut = $null
-}
-
-if ($upgOut -and ($upgOut | Out-String) -match [regex]::Escape($AppToDetect)) {
-    Write-Log "'$AppToDetect' is installed but an UPGRADE is available → NOT COMPLIANT (exit 1)."
-    Show-DetectToast -Status "Not compliant" -Message "Upgrade available for $AppToDetect."
-    Cleanup-ToastModule
-    exit 1
-}
-
-Write-Log "'$AppToDetect' installed and up to date → DETECTED (exit 0)."
-Show-DetectToast -Status "Detected" -Message "$AppToDetect installed and compliant."
-
-# Intune custom detection script expects exit code 0 AND something on STDOUT
-"Detected $AppToDetect"
-Cleanup-ToastModule
-exit 0

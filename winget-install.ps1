@@ -8,6 +8,24 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# ---------------------------------------------------------
+# Return code scheme (for Intune Win32App program results)
+# ---------------------------------------------------------
+# 0     : Success (standard)
+# 1707  : Success, no action (MSI)
+# 3010  : Soft reboot required
+# 1641  : Hard reboot required
+# 1618  : Retry (another installer in progress)
+#
+# Custom WIP failure codes:
+# 1000  : Unknown fatal error (top-level catch)
+# 1001  : winget.exe not found
+# 1002  : Script precondition/parameter error
+# 1003  : WinGet INSTALL failed
+# 1004  : Post-install mod script error
+# 1005  : WinGet UNINSTALL failed
+# ---------------------------------------------------------
+
 if (-not $AppIDs -or $AppIDs.Count -eq 0) {
     Write-Error "No AppIDs provided."
     exit 1002
@@ -46,79 +64,23 @@ function Write-Log {
     Write-Host $line
 }
 
-# BurntToast helpers - install from PSGallery on the fly and remove on exit
-$script:BurntToastAvailable = $false
-$script:BurntToastInstalledThisRun = $false
+$StandardInstallerCodes = @(0, 1707, 3010, 1641, 1618)
 
-function Initialize-Toast {
-    if ($script:BurntToastAvailable) { return }
-
-    try {
-        # Check if BurntToast is already available
-        $installed = Get-Module -ListAvailable BurntToast | Select-Object -First 1
-        if (-not $installed) {
-            # Install from PSGallery into CurrentUser scope
-            Write-Log "BurntToast not found. Installing from PSGallery..." "INFO"
-
-            if (-not (Get-PackageProvider -Name NuGet -ErrorAction SilentlyContinue)) {
-                Install-PackageProvider -Name NuGet -Force -Scope CurrentUser -ErrorAction Stop | Out-Null
-            }
-
-            if (-not (Get-PSRepository -Name "PSGallery" -ErrorAction SilentlyContinue)) {
-                Register-PSRepository -Default -ErrorAction Stop
-            }
-
-            $params = @{
-                Name         = 'BurntToast'
-                Force        = $true
-                Scope        = 'CurrentUser'
-                AllowClobber = $true
-            }
-            Install-Module @params -ErrorAction Stop | Out-Null
-            $script:BurntToastInstalledThisRun = $true
-        }
-
-        Import-Module BurntToast -Force -ErrorAction Stop
-        $script:BurntToastAvailable = $true
-        Write-Log "BurntToast module loaded." "INFO"
-    }
-    catch {
-        Write-Log "BurntToast not available: $($_.Exception.Message)" "WARN"
-        $script:BurntToastAvailable = $false
-    }
-}
-
-function Cleanup-ToastModule {
-    try {
-        if ($script:BurntToastAvailable) {
-            Remove-Module BurntToast -ErrorAction SilentlyContinue
-        }
-        if ($script:BurntToastInstalledThisRun) {
-            # Remove the module from disk only if we installed it in this run
-            Uninstall-Module -Name BurntToast -AllVersions -Force -ErrorAction SilentlyContinue
-        }
-    }
-    catch {
-        # Best-effort cleanup; ignore failures
-    }
-}
-
-function Show-AppToast {
+function Map-InstallerExitCode {
     param(
-        [string]$AppId,
-        [string]$Phase,
-        [string]$Message
+        [int]$RawExit,
+        [switch]$IsUninstall
     )
 
-    if (-not $script:BurntToastAvailable) { return }
-
-    try {
-        $title = "WinGet Intune - $Phase"
-        $body  = "$AppId - $Message"
-        New-BurntToastNotification -Text $title, $body | Out-Null
+    if ($StandardInstallerCodes -contains $RawExit) {
+        return $RawExit
     }
-    catch {
-        Write-Log "Failed to show BurntToast notification: $($_.Exception.Message)" "WARN"
+
+    if ($IsUninstall) {
+        return 1005
+    }
+    else {
+        return 1003
     }
 }
 
@@ -135,10 +97,12 @@ function Set-ExitCode {
         3010  { "Soft reboot required" }
         1641  { "Hard reboot required" }
         1618  { "Another installer in progress" }
+        1000  { "Unknown fatal error (top-level)" }
         1001  { "winget.exe not found" }
-        1002  { "Script internal error" }
-        1003  { "WinGet command failed" }
+        1002  { "Script precondition/parameter error" }
+        1003  { "WinGet INSTALL failed" }
         1004  { "Post-install mod script error" }
+        1005  { "WinGet UNINSTALL failed" }
         default { "Error/Unknown" }
     }
 
@@ -149,22 +113,34 @@ function Set-ExitCode {
     }
 }
 
+function Get-WingetPath {
+    try {
+        $cmd = Get-Command winget.exe -ErrorAction Stop
+        return $cmd.Source
+    }
+    catch {
+        Write-Log "winget.exe not in PATH, searching Program Files\WindowsApps..." "WARN"
+        $candidates = Get-ChildItem "C:\Program Files\WindowsApps" -Recurse -Filter winget.exe -ErrorAction SilentlyContinue
+        if ($candidates -and $candidates.Count -gt 0) {
+            $path = $candidates[0].FullName
+            Write-Log "Found winget.exe at '$path'." "INFO"
+            return $path
+        }
+        throw
+    }
+}
+
 try {
     # Locate winget
     try {
-        $winget = (Get-Command winget.exe -ErrorAction Stop).Source
+        $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
     }
     catch {
         Write-Log "winget.exe not found: $($_.Exception.Message)" "ERROR"
-        Initialize-Toast
-        Show-AppToast -AppId $baseToken -Phase $phaseName -Message "winget.exe not available (code 1001)."
         $script:ExitCode = 1001
-        return
+        throw
     }
-
-    Initialize-Toast
-    Show-AppToast -AppId $baseToken -Phase $phaseName -Message "Starting WinGet $phaseName. See $logFile for details."
 
     foreach ($AppRaw in $AppIDs) {
 
@@ -191,18 +167,17 @@ try {
 
             Write-Log "Executing: winget $($args -join ' ')"
             $out = & $winget @args 2>&1
-            $exit = $LASTEXITCODE
+            $rawExit = $LASTEXITCODE
 
             Write-Log ($out | Out-String).Trim()
+            Write-Log "Raw winget uninstall exit code: $rawExit"
 
-            if ($exit -eq 0) {
-                Show-AppToast -AppId $AppId -Phase "Uninstall" -Message "Completed successfully."
-            }
-            else {
-                Show-AppToast -AppId $AppId -Phase "Uninstall" -Message "Failed (code $exit)."
+            $mappedExit = Map-InstallerExitCode -RawExit $rawExit -IsUninstall
+            if ($mappedExit -eq 0 -and $rawExit -ne 0) {
+                $mappedExit = 1005
             }
 
-            Set-ExitCode -Code $exit -AppId $AppId -Phase "Uninstall"
+            Set-ExitCode -Code $mappedExit -AppId $AppId -Phase "Uninstall"
         }
         else {
             Write-Log "Installing/upgrading '$AppId' (raw: '$AppRaw')."
@@ -225,21 +200,20 @@ try {
 
             Write-Log "Executing: winget $($args -join ' ')"
             $out = & $winget @args 2>&1
-            $exit = $LASTEXITCODE
+            $rawExit = $LASTEXITCODE
 
             Write-Log ($out | Out-String).Trim()
+            Write-Log "Raw winget install exit code: $rawExit"
 
-            if ($exit -eq 0) {
-                Show-AppToast -AppId $AppId -Phase "Install" -Message "Completed successfully."
-            }
-            else {
-                Show-AppToast -AppId $AppId -Phase "Install" -Message "Failed (code $exit)."
+            $mappedExit = Map-InstallerExitCode -RawExit $rawExit
+            if ($mappedExit -eq 0 -and $rawExit -ne 0) {
+                $mappedExit = 1003
             }
 
-            Set-ExitCode -Code $exit -AppId $AppId -Phase "Install"
+            Set-ExitCode -Code $mappedExit -AppId $AppId -Phase "Install"
 
             # Optional post-install mod script, only if install succeeded
-            if ($exit -eq 0) {
+            if ($mappedExit -eq 0) {
                 $modsPath = Join-Path $PSScriptRoot "mods"
                 $modFile  = Join-Path $modsPath ($AppId + ".ps1")
 
@@ -253,6 +227,7 @@ try {
                         if ($script:ExitCode -eq 0) {
                             $script:ExitCode = 1004
                         }
+                        Set-ExitCode -Code 1004 -AppId $AppId -Phase "Install"
                     }
                 }
                 else {
@@ -262,11 +237,15 @@ try {
         }
     }
 }
+catch {
+    if ($script:ExitCode -eq 0) {
+        # Unexpected fatal error not mapped previously
+        $script:ExitCode = 1000
+        Write-Log "Unexpected fatal error: $($_.Exception.Message)" "ERROR"
+    }
+}
 finally {
-    try {
-        Stop-Transcript | Out-Null
-    } catch {}
-    Cleanup-ToastModule
+    try { Stop-Transcript | Out-Null } catch {}
 }
 
 exit $script:ExitCode
