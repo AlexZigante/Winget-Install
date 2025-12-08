@@ -254,6 +254,54 @@ function Set-ExitCode {
         default { "Error/Unknown" }
     }
 
+
+function Get-WIPInstallMarkerPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AppId
+    )
+    $markerRoot = "C:\ProgramData\Microsoft\IntuneManagementExtension\WinGetInstalled"
+    if (-not (Test-Path $markerRoot)) {
+        New-Item -ItemType Directory -Path $markerRoot -Force | Out-Null
+    }
+    $fileName = ($AppId -replace '[^\w\.-]', '_') + ".installed"
+    return (Join-Path $markerRoot $fileName)
+}
+
+function Set-WIPInstallMarker {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AppId,
+        [Parameter(Mandatory = $true)]
+        [bool]$Installed
+    )
+
+    $markerPath = Get-WIPInstallMarkerPath -AppId $AppId
+
+    if ($Installed) {
+        Write-Log "Creating install marker '$markerPath'."
+        try {
+            "Installed $(Get-Date -Format 's')" | Out-File -FilePath $markerPath -Encoding utf8 -Force
+        }
+        catch {
+            Write-Log "Failed to create marker '$markerPath': $($_.Exception.Message)" "WARN"
+        }
+    }
+    else {
+        if (Test-Path $markerPath) {
+            Write-Log "Removing install marker '$markerPath'."
+            try {
+                Remove-Item -Path $markerPath -Force -ErrorAction SilentlyContinue
+            }
+            catch {
+                Write-Log "Failed to remove marker '$markerPath': $($_.Exception.Message)" "WARN"
+            }
+        }
+        else {
+            Write-Log "Install marker '$markerPath' does not exist; nothing to remove." "INFO"
+        }
+    }
+}
     Write-Log "[$Phase][$AppId] exit code $Code → $desc"
 
     if ($script:ExitCode -eq 0 -and $Code -ne 0) {
@@ -301,6 +349,11 @@ try {
 
             $result = Invoke-WIPWinGetOperation -Operation 'Uninstall' -AppId $AppId -ExtraArgs $extraArgs -WingetPath $winget
             Set-ExitCode -Code $result.MappedExit -AppId $AppId -Phase "Uninstall"
+
+            if ($result.MappedExit -eq 0) {
+                # Successful uninstall -> remove marker
+                Set-WIPInstallMarker -AppId $AppId -Installed $false
+            }
         }
         else {
             Write-Log "Installing/upgrading '$AppId' (raw: '$AppRaw')."
@@ -310,6 +363,10 @@ try {
 
             # Optional post-install mod script, only if install succeeded
             if ($result.MappedExit -eq 0) {
+
+                # Successful install -> create marker
+                Set-WIPInstallMarker -AppId $AppId -Installed $true
+
                 $modsPath = Join-Path $PSScriptRoot "mods"
                 $modFile  = Join-Path $modsPath ($AppId + ".ps1")
 
@@ -324,6 +381,19 @@ try {
                             $script:ExitCode = 1004
                         }
                         Set-ExitCode -Code 1004 -AppId $AppId -Phase "Install"
+                    }
+                }
+                else {
+                    Write-Log "No mod script found for '$AppId'."
+                }
+            }
+            else {
+                # Install failed -> ensure marker is removed if present
+                Set-WIPInstallMarker -AppId $AppId -Installed $false
+            }
+        }
+    }
+              Set-ExitCode -Code 1004 -AppId $AppId -Phase "Install"
                     }
                 }
                 else {

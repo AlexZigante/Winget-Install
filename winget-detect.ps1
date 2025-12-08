@@ -8,6 +8,7 @@ $AppToDetect = "PLACEHOLDER"
 # 2003 : App not present in 'winget list' (not installed)
 # 2004 : 'winget upgrade' indicates an update available (not compliant)
 # 2005 : Installed & up to date (detected)
+# 2006 : Marker-based detection error
 
 $DetectionResultCode = 0
 
@@ -53,16 +54,31 @@ function Get-WingetPath {
     }
 }
 
+
+function Get-WIPInstallMarkerPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$AppId
+    )
+    $markerRoot = "C:\ProgramData\Microsoft\IntuneManagementExtension\WinGetInstalled"
+    if (-not (Test-Path $markerRoot)) {
+        return $null
+    }
+    $fileName = ($AppId -replace '[^\w\.-]', '_') + ".installed"
+    return (Join-Path $markerRoot $fileName)
+}
 Write-Log "Starting detection for '$AppToDetect'."
 
 try {
     # Locate winget
+    $hasWinget = $true
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
     }
     catch {
-        Write-Log "winget.exe not found: $($_.Exception.Message)" "ERROR"
+        Write-Log "winget.exe not found, will attempt marker-based detection." "WARN"
+        $hasWinget = $false
         $DetectionResultCode = 2001
         throw
     }
