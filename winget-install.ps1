@@ -75,6 +75,154 @@ function Map-InstallerExitCode {
     if ($StandardInstallerCodes -contains $RawExit) {
         return $RawExit
     }
+function Get-AgentExecutorPath {
+    <#
+        Returns the path to AgentExecutor.exe if present.
+        This binary ships with the Intune Management Extension and can
+        proxy WinGet operations even when winget.exe is not installed.
+    #>
+    $defaultPath = "C:\Program Files (x86)\Microsoft Intune Management Extension\agentexecutor.exe"
+    if (Test-Path $defaultPath) {
+        return $defaultPath
+    }
+    return $null
+}
+
+function Invoke-WIPWinGetOperation {
+    <#
+        Unified wrapper for WinGet operations.
+
+        - If $WingetPath is provided, call winget.exe directly (current behavior).
+        - If $WingetPath is $null, fall back to AgentExecutor.exe -executeWinGet
+          where available. This primarily supports Microsoft Store sourced apps.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Install','Uninstall')]
+        [string]$Operation,
+
+        [Parameter(Mandatory = $true)]
+        [string]$AppId,
+
+        [string[]]$ExtraArgs,
+
+        [string]$WingetPath,
+
+        [string]$RepositoryType = "MicrosoftStore",  # AgentExecutor WinGet library currently supports MS Store
+        [string]$InstallScope   = "System"
+    )
+
+    if ($WingetPath) {
+        # Use winget.exe as before
+        if ($Operation -eq 'Install') {
+            $args = @(
+                "install",
+                "--id", $AppId,
+                "-e",
+                "--silent",
+                "--disable-interactivity",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--scope", "machine",
+                "-s", "winget"
+            )
+        }
+        else {
+            $args = @(
+                "uninstall",
+                "--id", $AppId,
+                "-e",
+                "--silent",
+                "--disable-interactivity",
+                "--accept-source-agreements"
+            )
+        }
+
+        if ($ExtraArgs -and $ExtraArgs.Count -gt 0) {
+            $args += $ExtraArgs
+        }
+
+        Write-Log "Executing: winget $($args -join ' ')"
+        $out = & $WingetPath @args 2>&1
+        $rawExit = $LASTEXITCODE
+
+        Write-Log ($out | Out-String).Trim()
+        Write-Log "Raw winget $Operation exit code: $rawExit"
+
+        $mappedExit = if ($Operation -eq 'Install') {
+            Map-InstallerExitCode -RawExit $rawExit
+        }
+        else {
+            Map-InstallerExitCode -RawExit $rawExit -IsUninstall
+        }
+
+        if ($mappedExit -eq 0 -and $rawExit -ne 0) {
+            $mappedExit = if ($Operation -eq 'Install') { 1003 } else { 1005 }
+        }
+
+        return [PSCustomObject]@{
+            RawExit    = $rawExit
+            MappedExit = $mappedExit
+            Tool       = "winget.exe"
+        }
+    }
+    else {
+        # Fallback: AgentExecutor.exe -executeWinGet
+        $agent = Get-AgentExecutorPath
+        if (-not $agent) {
+            Write-Log "Neither winget.exe nor AgentExecutor.exe could be located for '$AppId'." "ERROR"
+            throw "No WinGet-capable tool available."
+        }
+
+        $pipeName = "WIP-{0}" -f ([guid]::NewGuid().ToString("N"))
+
+        if ($Operation -eq 'Install') {
+            $args = @(
+                "-executeWinGet",
+                "-packageId", $AppId,
+                "-operationType", "Install",
+                "-repositoryType", $RepositoryType,
+                "-installScope", $InstallScope,
+                "-installTimeout", "60",
+                "-installVisibility", "0",
+                "-pipeHandle", $pipeName
+            )
+        }
+        else {
+            $args = @(
+                "-executeWinGet",
+                "-packageId", $AppId,
+                "-operationType", "Uninstall",
+                "-repositoryType", $RepositoryType,
+                "-installScope", $InstallScope,
+                "-pipeHandle", $pipeName
+            )
+        }
+
+        Write-Log "Executing AgentExecutor fallback: $agent $($args -join ' ')" "INFO"
+        $out = & $agent @args 2>&1
+        $rawExit = $LASTEXITCODE
+
+        Write-Log ($out | Out-String).Trim()
+        Write-Log "AgentExecutor $Operation exit code: $rawExit"
+
+        # Conservative mapping: 0 = success, anything else = generic WinGet failure
+        if ($Operation -eq 'Install') {
+            $mappedExit = if ($rawExit -eq 0) { 0 } else { 1003 }
+        }
+        else {
+            $mappedExit = if ($rawExit -eq 0) { 0 } else { 1005 }
+        }
+
+        return [PSCustomObject]@{
+            RawExit    = $rawExit
+            MappedExit = $mappedExit
+            Tool       = "AgentExecutor.exe"
+        }
+    }
+}
+
+
 
     if ($IsUninstall) {
         return 1005
@@ -131,15 +279,14 @@ function Get-WingetPath {
 }
 
 try {
-    # Locate winget
+    # Locate winget (optional)
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
     }
     catch {
-        Write-Log "winget.exe not found: $($_.Exception.Message)" "ERROR"
-        $script:ExitCode = 1001
-        throw
+        Write-Log "winget.exe not found, will try AgentExecutor.exe fallback where available." "WARN"
+        $winget = $null
     }
 
     foreach ($AppRaw in $AppIDs) {
@@ -152,68 +299,17 @@ try {
         if ($Uninstall) {
             Write-Log "Uninstalling '$AppId' (raw: '$AppRaw')."
 
-            $args = @(
-                "uninstall",
-                "--id", $AppId,
-                "-e",
-                "--silent",
-                "--disable-interactivity",
-                "--accept-source-agreements"
-            )
-
-            if ($extraArgs.Count -gt 0) {
-                $args += $extraArgs
-            }
-
-            Write-Log "Executing: winget $($args -join ' ')"
-            $out = & $winget @args 2>&1
-            $rawExit = $LASTEXITCODE
-
-            Write-Log ($out | Out-String).Trim()
-            Write-Log "Raw winget uninstall exit code: $rawExit"
-
-            $mappedExit = Map-InstallerExitCode -RawExit $rawExit -IsUninstall
-            if ($mappedExit -eq 0 -and $rawExit -ne 0) {
-                $mappedExit = 1005
-            }
-
-            Set-ExitCode -Code $mappedExit -AppId $AppId -Phase "Uninstall"
+            $result = Invoke-WIPWinGetOperation -Operation 'Uninstall' -AppId $AppId -ExtraArgs $extraArgs -WingetPath $winget
+            Set-ExitCode -Code $result.MappedExit -AppId $AppId -Phase "Uninstall"
         }
         else {
             Write-Log "Installing/upgrading '$AppId' (raw: '$AppRaw')."
 
-            $args = @(
-                "install",
-                "--id", $AppId,
-                "-e",
-                "--silent",
-                "--disable-interactivity",
-                "--accept-package-agreements",
-                "--accept-source-agreements",
-                "--scope", "machine",
-                "-s", "winget"
-            )
-
-            if ($extraArgs.Count -gt 0) {
-                $args += $extraArgs
-            }
-
-            Write-Log "Executing: winget $($args -join ' ')"
-            $out = & $winget @args 2>&1
-            $rawExit = $LASTEXITCODE
-
-            Write-Log ($out | Out-String).Trim()
-            Write-Log "Raw winget install exit code: $rawExit"
-
-            $mappedExit = Map-InstallerExitCode -RawExit $rawExit
-            if ($mappedExit -eq 0 -and $rawExit -ne 0) {
-                $mappedExit = 1003
-            }
-
-            Set-ExitCode -Code $mappedExit -AppId $AppId -Phase "Install"
+            $result = Invoke-WIPWinGetOperation -Operation 'Install' -AppId $AppId -ExtraArgs $extraArgs -WingetPath $winget
+            Set-ExitCode -Code $result.MappedExit -AppId $AppId -Phase "Install"
 
             # Optional post-install mod script, only if install succeeded
-            if ($mappedExit -eq 0) {
+            if ($result.MappedExit -eq 0) {
                 $modsPath = Join-Path $PSScriptRoot "mods"
                 $modFile  = Join-Path $modsPath ($AppId + ".ps1")
 
@@ -236,6 +332,7 @@ try {
             }
         }
     }
+}
 }
 catch {
     if ($script:ExitCode -eq 0) {
