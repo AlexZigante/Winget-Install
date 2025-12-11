@@ -1,143 +1,226 @@
-# Winget Detect - WIP v4 (Intune custom detection script)
-$AppToDetect = "PLACEHOLDER"
+[CmdletBinding()]
+param(
+    [Parameter(Mandatory = $true)]
+    [string]$AppToDetect
+)
 
-# Detection internal result codes (for logs only)
-# 2000 : Unknown detection error
-# 2001 : winget.exe not found
-# 2002 : 'winget list' failed
-# 2003 : App not present in 'winget list' (not installed)
-# 2004 : 'winget upgrade' indicates an update available (not compliant)
-# 2005 : Installed & up to date (detected)
-# 2006 : Marker-based detection error
-
+$ErrorActionPreference = 'Stop'
+$global:LASTEXITCODE = 0
 $DetectionResultCode = 0
 
-# Logs under Intune Management Extension tree, per app
-$logDirName = $AppToDetect -replace '[^\w\.-]', '_'
-$imeLogRoot = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
-if (-not (Test-Path $imeLogRoot)) {
-    New-Item -ItemType Directory -Path $imeLogRoot -Force | Out-Null
+function Get-LogDirectory {
+    $base = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    $dir  = Join-Path $base "Winget-Detect"
+    if (-not (Test-Path $dir)) {
+        New-Item -Path $dir -ItemType Directory -Force | Out-Null
+    }
+    return $dir
 }
-$logRoot = Join-Path $imeLogRoot $logDirName
-if (-not (Test-Path $logRoot)) {
-    New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+
+function Get-LogFilePath {
+    param(
+        [string]$Prefix = "Detect"
+    )
+    $dir = Get-LogDirectory
+    $ts  = Get-Date -Format "yyyyMMdd_HHmmss"
+    return Join-Path $dir ("{0}_{1}.log" -f $Prefix, $ts)
 }
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$logFile = Join-Path $logRoot ("Detect_{0}.log" -f $timestamp)
+
+$Global:LogFile = Get-LogFilePath -Prefix "Detect"
 
 function Write-Log {
     param(
+        [Parameter(Mandatory=$true)]
         [string]$Message,
-        [ValidateSet('INFO','WARN','ERROR')]
-        [string]$Level = 'INFO'
+        [ValidateSet("INFO","WARN","ERROR")]
+        [string]$Level = "INFO"
     )
-    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "{0} [{1}] {2}" -f $ts, $Level, $Message
-    Add-Content -Path $logFile -Value $line
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[{0}] [{1}] {2}" -f $timestamp, $Level, $Message
     Write-Host $line
+    try {
+        Add-Content -Path $Global:LogFile -Value $line
+    }
+    catch {
+    }
+}
+
+try {
+    Start-Transcript -Path $Global:LogFile -Append -ErrorAction SilentlyContinue | Out-Null
+}
+catch {
+    Write-Log "Failed to start transcript: $($_.Exception.Message)" "WARN"
 }
 
 function Get-WingetPath {
     try {
-        $cmd = Get-Command winget.exe -ErrorAction Stop
+        $cmd = Get-Command -Name 'winget.exe' -ErrorAction Stop
         return $cmd.Source
     }
     catch {
-        Write-Log "winget.exe not in PATH, searching Program Files\WindowsApps..." "WARN"
-        $candidates = Get-ChildItem "C:\Program Files\WindowsApps" -Recurse -Filter winget.exe -ErrorAction SilentlyContinue
-        if ($candidates -and $candidates.Count -gt 0) {
-            $path = $candidates[0].FullName
-            Write-Log "Found winget.exe at '$path'." "INFO"
-            return $path
+        Write-Log "winget.exe not found via PATH: $($_.Exception.Message)" "WARN"
+    }
+
+    $progApps = "C:\Program Files\WindowsApps"
+    if (Test-Path $progApps) {
+        try {
+            $candidate = Get-ChildItem -Path $progApps -Recurse -Filter 'winget.exe' -ErrorAction SilentlyContinue |
+                         Select-Object -First 1
+            if ($candidate) {
+                Write-Log "winget.exe found in WindowsApps: '$($candidate.FullName)'."
+                return $candidate.FullName
+            }
         }
-        throw
+        catch {
+            Write-Log "Error while searching '$progApps' for winget.exe: $($_.Exception.Message)" "WARN"
+        }
     }
+
+    $defaultUserWinget = "C:\Users\defaultuser0\AppData\Local\Microsoft\WindowsApps\winget.exe"
+    if (Test-Path $defaultUserWinget) {
+        Write-Log "winget.exe found at defaultuser0 path: '$defaultUserWinget'."
+        return $defaultUserWinget
+    }
+
+    Write-Log "winget.exe not found, attempting to register App Installer (Microsoft.DesktopAppInstaller_8wekyb3d8bbwe)..." "WARN"
+
+    try {
+        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+        Write-Log "App Installer registration completed, re-checking for winget.exe."
+    }
+    catch {
+        Write-Log "Failed to register App Installer for detection: $($_.Exception.Message)" "ERROR"
+    }
+
+    try {
+        $cmd = Get-Command -Name 'winget.exe' -ErrorAction Stop
+        return $cmd.Source
+    }
+    catch {
+        Write-Log "winget.exe still not found via PATH after App Installer registration." "WARN"
+    }
+
+    if (Test-Path $progApps) {
+        try {
+            $candidate = Get-ChildItem -Path $progApps -Recurse -Filter 'winget.exe' -ErrorAction SilentlyContinue |
+                         Select-Object -First 1
+            if ($candidate) {
+                Write-Log "winget.exe found in WindowsApps after App Installer registration: '$($candidate.FullName)'."
+                return $candidate.FullName
+            }
+        }
+        catch {
+            Write-Log "Error while searching '$progApps' for winget.exe after App Installer registration: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    if (Test-Path $defaultUserWinget) {
+        Write-Log "winget.exe found at defaultuser0 path after App Installer registration: '$defaultUserWinget'."
+        return $defaultUserWinget
+    }
+
+    throw "winget.exe not found even after attempting App Installer registration."
 }
 
-
-function Get-WIPInstallMarkerPath {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$AppId
-    )
-    $markerRoot = "C:\ProgramData\Microsoft\IntuneManagementExtension\WinGetInstalled"
-    if (-not (Test-Path $markerRoot)) {
-        return $null
-    }
-    $fileName = ($AppId -replace '[^\w\.-]', '_') + ".installed"
-    return (Join-Path $markerRoot $fileName)
-}
-Write-Log "Starting detection for '$AppToDetect'."
+Write-Log "========== Winget-Detect starting for '$AppToDetect' =========="
 
 try {
-    # Locate winget
-    $hasWinget = $true
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
     }
     catch {
-        Write-Log "winget.exe not found, will attempt marker-based detection." "WARN"
-        $hasWinget = $false
+        Write-Log "winget.exe not available even after App Installer registration: $($_.Exception.Message)" "ERROR"
         $DetectionResultCode = 2001
-        throw
+        "NotDetected: Code 2001 (winget not available)"
+        $global:LASTEXITCODE = 1
+        exit 1
     }
 
-    # Check if app is installed, based on 'winget list'
-    try {
-        $listOut = & $winget list --id $AppToDetect -e --accept-source-agreements 2>&1
-        $listExit = $LASTEXITCODE
-        Write-Log "'winget list' exit code: $listExit"
-        Write-Log ("'winget list' output:`n{0}" -f (($listOut | Out-String).Trim()))
-    }
-    catch {
-        Write-Log "Error running 'winget list': $($_.Exception.Message)" "ERROR"
+    Write-Log "Running 'winget list' for '$AppToDetect'."
+    $listArgs = @(
+        "list",
+        "--id", $AppToDetect,
+        "-e"
+    )
+
+    $listOut = & $winget @listArgs 2>&1
+    $listExit = $LASTEXITCODE
+
+    Write-Log ($listOut | Out-String).Trim()
+    Write-Log "winget list exit code: $listExit"
+
+    if ($listExit -ne 0) {
+        Write-Log "winget list failed for '$AppToDetect'." "ERROR"
         $DetectionResultCode = 2002
-        throw
+        "NotDetected: Code 2002 (winget list failed)"
+        $global:LASTEXITCODE = 1
+        exit 1
     }
 
-    if (-not $listOut -or ($listOut | Out-String) -notmatch [regex]::Escape($AppToDetect)) {
-        Write-Log "'$AppToDetect' not present in 'winget list' → NOT INSTALLED."
+    $installed = $false
+    foreach ($line in $listOut) {
+        if ($line -match [Regex]::Escape($AppToDetect)) {
+            $installed = $true
+            break
+        }
+    }
+
+    if (-not $installed) {
+        Write-Log "'$AppToDetect' not present in winget list → NOT INSTALLED." "INFO"
         $DetectionResultCode = 2003
+        "NotDetected: Code 2003 (not installed)"
         $global:LASTEXITCODE = 1
-        "NotDetected: Code 2003"
         exit 1
     }
 
-    # Optional: treat available upgrade as non-compliant
-    try {
-        $upgOut = & $winget upgrade --id $AppToDetect -e --accept-source-agreements 2>&1
-        $upgExit = $LASTEXITCODE
-        Write-Log "'winget upgrade' exit code: $upgExit"
-        Write-Log ("'winget upgrade' output:`n{0}" -f (($upgOut | Out-String).Trim()))
-    }
-    catch {
-        Write-Log "Error running 'winget upgrade': $($_.Exception.Message)" "WARN"
-        $upgOut = $null
+    Write-Log "Running 'winget upgrade' for '$AppToDetect'."
+    $upArgs = @(
+        "upgrade",
+        "--id", $AppToDetect,
+        "-e"
+    )
+
+    $upOut = & $winget @upArgs 2>&1
+    $upExit = $LASTEXITCODE
+
+    Write-Log ($upOut | Out-String).Trim()
+    Write-Log "winget upgrade exit code: $upExit"
+
+    $upgradeAvailable = $false
+    if ($upExit == 0) {
+        foreach ($line in $upOut) {
+            if ($line -match [Regex]::Escape($AppToDetect)) {
+                $upgradeAvailable = $true
+                break
+            }
+        }
     }
 
-    if ($upgOut -and ($upgOut | Out-String) -match [regex]::Escape($AppToDetect)) {
-        Write-Log "'$AppToDetect' is installed but an UPGRADE is available → NOT COMPLIANT."
+    if ($upgradeAvailable) {
+        Write-Log "'$AppToDetect' has an upgrade available → NOT COMPLIANT (but installed)." "WARN"
         $DetectionResultCode = 2004
+        "NotDetected: Code 2004 (upgrade available)"
         $global:LASTEXITCODE = 1
-        "NotDetected: Code 2004"
         exit 1
     }
 
-    Write-Log "'$AppToDetect' installed and up to date → DETECTED."
+    Write-Log "'$AppToDetect' installed and up to date → DETECTED." "INFO"
     $DetectionResultCode = 2005
-
-    # Intune custom detection script expects exit code 0 AND something on STDOUT for "installed"
-    "Detected: Code 2005"
+    "Detected: Code 2005 (installed & up to date)"
     $global:LASTEXITCODE = 0
     exit 0
 }
 catch {
     if ($DetectionResultCode -eq 0) {
         $DetectionResultCode = 2000
+        Write-Log "Unexpected detection error: $($_.Exception.Message)" "ERROR"
     }
-    Write-Log "Detection fatal error (code $DetectionResultCode): $($_.Exception.Message)" "ERROR"
     $global:LASTEXITCODE = 1
-    "NotDetected: Code $DetectionResultCode"
     exit 1
+}
+finally {
+    Write-Log "Winget-Detect finished with DetectionResultCode $DetectionResultCode, exit code $global:LASTEXITCODE."
+    try { Stop-Transcript | Out-Null } catch {}
 }
