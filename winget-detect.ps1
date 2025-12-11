@@ -1,8 +1,5 @@
-[CmdletBinding()]
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$AppToDetect
-)
+# Winget Detect - WIP v4 (Intune custom detection script)
+$AppToDetect = "PLACEHOLDER"
 
 $ErrorActionPreference = 'Stop'
 $global:LASTEXITCODE = 0
