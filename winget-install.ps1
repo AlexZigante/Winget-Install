@@ -164,6 +164,13 @@ try {
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
+        Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements'." "INFO"
+        try {
+            $null = & $winget upgrade --accept-source-agreements --accept-package-agreements 2>&1
+        }
+        catch {
+            Write-Log "Source refresh via 'winget upgrade' failed: $($_.Exception.Message)" "WARN"
+        }
     }
     catch {
         Write-Log "winget.exe not available even after App Installer registration: $($_.Exception.Message)" "ERROR"
