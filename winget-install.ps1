@@ -217,7 +217,8 @@ try {
                 "-e",
                 "--silent",
                 "--disable-interactivity",
-                "--accept-source-agreements --accept-package-agreements"
+                "--accept-source-agreements",
+                "--accept-package-agreements"
             )
 
             if ($extraArgs.Count -gt 0) {
@@ -248,8 +249,8 @@ try {
                 "-e",
                 "--silent",
                 "--disable-interactivity",
+                "--accept-source-agreements",
                 "--accept-package-agreements",
-                "--accept-source-agreements --accept-package-agreements",
                 "--scope", "machine",
                 "-s", "winget"
             )
