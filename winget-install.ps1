@@ -9,6 +9,24 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:ExitCode = 0
 
+
+# Selected WinGet CLI exit codes we care about for detection/logging
+$WinGetCodeInfo = @{
+    -1978335212 = "APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND: No packages found"
+    -1978335210 = "APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND: Multiple packages found matching the criteria"
+    -1978335189 = "APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE: No applicable update found"
+}
+
+function Write-WinGetCodeInfo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Code
+    )
+    if ($WinGetCodeInfo.ContainsKey($Code)) {
+        Write-Log ("WinGet exit code {0}: {1}" -f $Code, $WinGetCodeInfo[$Code]) "INFO"
+    }
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory=$true)]
@@ -165,7 +183,7 @@ try {
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
-        Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements --accept-package-agreements'." "INFO"
+        Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements'." "INFO"
         try {
             $null = & $winget source update --accept-source-agreements 2>&1
             $null = & $winget upgrade --accept-source-agreements 2>&1
@@ -212,6 +230,7 @@ try {
 
             Write-Log ($out | Out-String).Trim()
             Write-Log "Raw winget Uninstall exit code: $rawExit"
+            Write-WinGetCodeInfo -Code $rawExit
 
             $mappedExit = Map-InstallerExitCode -RawExit $rawExit -IsUninstall
             if ($mappedExit -eq 0 -and $rawExit -ne 0) {
@@ -245,6 +264,7 @@ try {
 
             Write-Log ($out | Out-String).Trim()
             Write-Log "Raw winget Install exit code: $rawExit"
+            Write-WinGetCodeInfo -Code $rawExit
 
             $mappedExit = Map-InstallerExitCode -RawExit $rawExit
             if ($mappedExit -eq 0 -and $rawExit -ne 0) {

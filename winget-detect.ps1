@@ -11,6 +11,24 @@ $AppToDetect = "PLACEHOLDER"
 
 $DetectionResultCode = 0
 
+
+# Selected WinGet CLI exit codes we care about for detection/logging
+$WinGetCodeInfo = @{
+    -1978335212 = "APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND: No packages found"
+    -1978335210 = "APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND: Multiple packages found matching the criteria"
+    -1978335189 = "APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE: No applicable update found"
+}
+
+function Write-WinGetCodeInfo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Code
+    )
+    if ($WinGetCodeInfo.ContainsKey($Code)) {
+        Write-Log ("WinGet exit code {0}: {1}" -f $Code, $WinGetCodeInfo[$Code]) "INFO"
+    }
+}
+
 # Logs under Intune Management Extension tree, per app
 $logDirName = $AppToDetect -replace '[^\w\.-]', '_'
 $imeLogRoot = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
@@ -158,10 +176,11 @@ try {
     # Check if app is installed, based on 'winget list'
     try {
         Write-Log "Running 'winget list' for '$AppToDetect'." "INFO"
-        $listOut = & $winget list --id $AppToDetect -e -s winget --accept-source-agreements --accept-package-agreements 2>&1
+        $listOut = & $winget list --id $AppToDetect -e -s winget --accept-source-agreements 2>&1
         $listExit = $LASTEXITCODE
         Write-Log "'winget list' exit code: $listExit" "INFO"
         Write-Log ("'winget list' output:`n{0}" -f (($listOut | Out-String).Trim())) "INFO"
+        Write-WinGetCodeInfo -Code $listExit
     }
     catch {
         Write-Log "Error running 'winget list': $($_.Exception.Message)" "ERROR"
@@ -171,31 +190,61 @@ try {
         exit 1
     }
 
-    $installed = $false
-    if ($listOut) {
-        foreach ($line in $listOut) {
-            if ($line -match [regex]::Escape($AppToDetect)) {
-                $installed = $true
-                break
+    # Interpret list exit code
+    if ($listExit -eq 0) {
+        $installed = $false
+        if ($listOut) {
+            foreach ($line in $listOut) {
+                if ($line -match [regex]::Escape($AppToDetect)) {
+                    $installed = $true
+                    break
+                }
             }
         }
-    }
 
-    if (-not $installed) {
-        Write-Log "'$AppToDetect' not present in 'winget list' → NOT INSTALLED." "INFO"
+        if (-not $installed) {
+            Write-Log "'$AppToDetect' not present in 'winget list' → NOT INSTALLED." "INFO"
+            $DetectionResultCode = 2003
+            $global:LASTEXITCODE = 1
+            "NotDetected: Code 2003 (not installed)"
+            exit 1
+        }
+    }
+    elseif ($listExit -eq -1978335212) {
+        # APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND
+        Write-Log "winget list returned APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND (-1978335212) → NOT INSTALLED." "INFO"
         $DetectionResultCode = 2003
         $global:LASTEXITCODE = 1
         "NotDetected: Code 2003 (not installed)"
         exit 1
     }
+    elseif ($listExit -eq -1978335210) {
+        # APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND
+        Write-Log "winget list returned APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND (-1978335210) → ambiguous AppId." "ERROR"
+        $DetectionResultCode = 2006
+        $global:LASTEXITCODE = 1
+        "NotDetected: Code 2006 (multiple matches)"
+        exit 1
+    }
+    elseif ($listExit -ne 0) {
+        # Any other non-zero exit is a generic list failure
+        Write-Log "winget list failed with unexpected exit code $listExit." "ERROR"
+        $DetectionResultCode = 2002
+        $global:LASTEXITCODE = 1
+        "NotDetected: Code 2002 (winget list failed)"
+        exit 1
+    }
 
+    # If we reach here, app is installed; proceed to upgrade check
     # If installed, check if an upgrade is available
+
     try {
         Write-Log "Running 'winget upgrade' for '$AppToDetect'." "INFO"
-        $upgOut = & $winget upgrade --id $AppToDetect -e -s winget --accept-source-agreements --accept-package-agreements --accept-package-agreements 2>&1
+                $upgOut = & $winget upgrade --id $AppToDetect -e -s winget --accept-source-agreements --accept-package-agreements 2>&1
         $upgExit = $LASTEXITCODE
         Write-Log "'winget upgrade' exit code: $upgExit" "INFO"
         Write-Log ("'winget upgrade' output:`n{0}" -f (($upgOut | Out-String).Trim())) "INFO"
+        Write-WinGetCodeInfo -Code $upgExit
     }
     catch {
         # If upgrade check fails, we treat as unknown error
