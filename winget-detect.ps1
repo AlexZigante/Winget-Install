@@ -140,7 +140,7 @@ try {
         Write-Log "Using winget at '$winget'." "INFO"
         Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements'." "INFO"
         try {
-            $null = & $winget upgrade --accept-source-agreements --accept-package-agreements 2>&1
+            $null = & $winget upgrade --accept-source-agreements 2>&1
         }
         catch {
             Write-Log "Source refresh via 'winget upgrade' failed: $($_.Exception.Message)" "WARN"
@@ -191,7 +191,7 @@ try {
     # If installed, check if an upgrade is available
     try {
         Write-Log "Running 'winget upgrade' for '$AppToDetect'." "INFO"
-        $upgOut = & $winget upgrade --id $AppToDetect -e -s winget --accept-source-agreements 2>&1
+        $upgOut = & $winget upgrade --id $AppToDetect -e -s winget --accept-source-agreements --accept-package-agreements 2>&1
         $upgExit = $LASTEXITCODE
         Write-Log "'winget upgrade' exit code: $upgExit" "INFO"
         Write-Log ("'winget upgrade' output:`n{0}" -f (($upgOut | Out-String).Trim())) "INFO"
