@@ -9,26 +9,6 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:ExitCode = 0
 
-function Get-LogDirectory {
-    $base = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
-    $dir  = Join-Path $base "Winget-Install"
-    if (-not (Test-Path $dir)) {
-        New-Item -Path $dir -ItemType Directory -Force | Out-Null
-    }
-    return $dir
-}
-
-function Get-LogFilePath {
-    param(
-        [string]$Prefix = "Install"
-    )
-    $dir = Get-LogDirectory
-    $ts  = Get-Date -Format "yyyyMMdd_HHmmss"
-    return Join-Path $dir ("{0}_{1}.log" -f $Prefix, $ts)
-}
-
-$Global:LogFile = Get-LogFilePath -Prefix (if ($Uninstall) { "Uninstall" } else { "Install" })
-
 function Write-Log {
     param(
         [Parameter(Mandatory=$true)]
@@ -46,9 +26,30 @@ function Write-Log {
     catch {
     }
 }
+function Set-AppLogFile {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$AppId,
+        [switch]$Uninstall
+    )
+
+    $safeName   = $AppId -replace '[^\w\.-]', '_'
+    $imeLogRoot = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    if (-not (Test-Path $imeLogRoot)) {
+        New-Item -ItemType Directory -Path $imeLogRoot -Force | Out-Null
+    }
+    $logRoot = Join-Path $imeLogRoot $safeName
+    if (-not (Test-Path $logRoot)) {
+        New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+    }
+
+    $ts     = Get-Date -Format "yyyyMMdd_HHmmss"
+    $prefix = if ($Uninstall) { "Uninstall" } else { "Install" }
+    $Global:LogFile = Join-Path $logRoot ("{0}_{1}.log" -f $prefix, $ts)
+}
+
 
 try {
-    Start-Transcript -Path $Global:LogFile -Append -ErrorAction SilentlyContinue | Out-Null
 }
 catch {
     Write-Log "Failed to start transcript: $($_.Exception.Message)" "WARN"
@@ -164,7 +165,7 @@ try {
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
-        Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements'." "INFO"
+        Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements --accept-package-agreements'." "INFO"
         try {
             $null = & $winget source update --accept-source-agreements 2>&1
             $null = & $winget upgrade --accept-source-agreements 2>&1
@@ -180,9 +181,14 @@ try {
     }
 
     foreach ($AppRaw in $AppIDs) {
+
         $tokens    = $AppRaw -split ' '
         $AppId     = $tokens[0]
         $extraArgs = if ($tokens.Count -gt 1) { $tokens[1..($tokens.Count - 1)] } else { @() }
+        # Initialize per-app log file
+        Set-AppLogFile -AppId $AppId -Uninstall:([bool]$Uninstall)
+        Write-Log ("===== {0} for '{1}' (raw: '{2}') =====" -f ($(if ($Uninstall) { "Uninstall" } else { "Install" }), $AppId, $AppRaw))
+
 
         if ($Uninstall) {
             Write-Log "Uninstalling '$AppId' (raw: '$AppRaw')."
@@ -193,7 +199,7 @@ try {
                 "-e",
                 "--silent",
                 "--disable-interactivity",
-                "--accept-source-agreements"
+                "--accept-source-agreements --accept-package-agreements"
             )
 
             if ($extraArgs.Count -gt 0) {
@@ -224,7 +230,7 @@ try {
                 "--silent",
                 "--disable-interactivity",
                 "--accept-package-agreements",
-                "--accept-source-agreements",
+                "--accept-source-agreements --accept-package-agreements",
                 "--scope", "machine",
                 "-s", "winget"
             )
@@ -278,8 +284,6 @@ catch {
     }
 }
 finally {
-    Write-Log "Winget-Install finished with ExitCode $script:ExitCode."
-    try { Stop-Transcript | Out-Null } catch {}
-}
+    Write-Log "Winget-Install finished with ExitCode $script:ExitCode."}
 
 exit $script:ExitCode
