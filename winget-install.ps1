@@ -166,6 +166,7 @@ try {
         Write-Log "Using winget at '$winget'."
         Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements'." "INFO"
         try {
+            $null = & $winget source update --accept-source-agreements 2>&1
             $null = & $winget upgrade --accept-source-agreements 2>&1
         }
         catch {
