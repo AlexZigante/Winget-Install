@@ -1,5 +1,6 @@
 # Winget Detect - Autopilot Bootstrap v3 (Intune custom detection script)
 $AppToDetect = "PLACEHOLDER"
+$ExpectedVersion = "PLACEHOLDER_VERSION"
 
 # Detection internal result codes (for logs only)
 # 2000 : Unknown detection error
@@ -10,6 +11,7 @@ $AppToDetect = "PLACEHOLDER"
 # 2005 : Installed & up to date (detected)
 
 $DetectionResultCode = 0
+$IsVersionPinned = -not [string]::IsNullOrWhiteSpace($ExpectedVersion)
 
 
 # Selected WinGet CLI exit codes we care about for detection/logging
@@ -17,8 +19,9 @@ $WinGetCodeInfo = @{
     -1978335212 = "APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND: No packages found"
     -1978335210 = "APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND: Multiple packages found matching the criteria"
     -1978335189 = "APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE: No applicable update found"
+    -1978334963 = "APPINSTALLER_CLI_ERROR_INSTALL_ALREADY_INSTALLED: Another version of this application is already installed"
+    -1978334962 = "APPINSTALLER_CLI_ERROR_INSTALL_DOWNGRADE: A higher version of this application is already installed"
 }
-
 function Write-WinGetCodeInfo {
     param(
         [Parameter(Mandatory = $true)]
@@ -193,10 +196,17 @@ try {
     # Interpret list exit code
     if ($listExit -eq 0) {
         $installed = $false
+        $installedVersion = $null
         if ($listOut) {
             foreach ($line in $listOut) {
                 if ($line -match [regex]::Escape($AppToDetect)) {
                     $installed = $true
+                    # Try to parse installed version from the row containing the AppId
+                    $tokens = $line -split '\s+'
+                    $idIndex = [Array]::IndexOf($tokens, $AppToDetect)
+                    if ($idIndex -ge 0 -and ($idIndex + 1) -lt $tokens.Length) {
+                        $installedVersion = $tokens[$idIndex + 1]
+                    }
                     break
                 }
             }
@@ -235,48 +245,139 @@ try {
         exit 1
     }
 
-    # If we reach here, app is installed; proceed to upgrade check
-    # If installed, check if an upgrade is available
+    # At this point, app is installed. If a specific version was requested via WingetIntunePackager,
+    # enforce that version (upgrade or downgrade). If version is satisfied, do NOT check for upgrades.
+    if ($IsVersionPinned) {
+        if (-not $installedVersion) {
+            Write-Log "App is installed but installed version could not be parsed from 'winget list'." "WARN"
+            # Avoid blocking Autopilot on formatting quirks; treat as detected.
+            $DetectionResultCode = 2005
+            "Detected: Code 2005 (installed)"
+            $global:LASTEXITCODE = 0
+            exit 0
+        }
 
+        Write-Log "Expected version: '$ExpectedVersion', installed version: '$installedVersion'." "INFO"
+        if ($installedVersion -eq $ExpectedVersion) {
+            Write-Log "Installed version matches expected version → DETECTED (pinned)." "INFO"
+            $DetectionResultCode = 2005
+            "Detected: Code 2005 (installed, pinned version)"
+            $global:LASTEXITCODE = 0
+            exit 0
+        }
+
+        Write-Log "Version mismatch → attempting remediation to reach expected version '$ExpectedVersion'." "WARN"
+
+        # Attempt 1: direct install of expected version (may upgrade/repair).
+        $remediateOut = & $winget install --id $AppToDetect -e -s winget --version $ExpectedVersion --scope machine --silent --disable-interactivity --accept-source-agreements --accept-package-agreements 2>&1
+        $remediateExit = $LASTEXITCODE
+        Write-Log "Remediation (install --version) exit code: $remediateExit" "INFO"
+        Write-Log ("Remediation output:`n{0}" -f (($remediateOut | Out-String).Trim())) "INFO"
+        Write-WinGetCodeInfo -Code $remediateExit
+
+        # Re-check version after attempt 1
+        $postList = & $winget list --id $AppToDetect -e -s winget --accept-source-agreements 2>&1
+        $postExit = $LASTEXITCODE
+        $postVersion = $null
+        if ($postExit -eq 0 -and $postList) {
+            foreach ($line in $postList) {
+                if ($line -match [regex]::Escape($AppToDetect)) {
+                    $tokens = $line -split '\s+'
+                    $idIndex = [Array]::IndexOf($tokens, $AppToDetect)
+                    if ($idIndex -ge 0 -and ($idIndex + 1) -lt $tokens.Length) {
+                        $postVersion = $tokens[$idIndex + 1]
+                    }
+                    break
+                }
+            }
+        }
+
+        if ($postVersion -eq $ExpectedVersion) {
+            Write-Log "Remediation succeeded: installed version now matches expected version → DETECTED." "INFO"
+            $DetectionResultCode = 2005
+            "Detected: Code 2005 (remediated to pinned version)"
+            $global:LASTEXITCODE = 0
+            exit 0
+        }
+
+        # Attempt 2: uninstall then install expected version (handles downgrades reliably).
+        Write-Log "Attempting uninstall+install to enforce pinned version." "WARN"
+        $unOut = & $winget uninstall --id $AppToDetect -e -s winget --silent --disable-interactivity --accept-source-agreements --accept-package-agreements 2>&1
+        $unExit = $LASTEXITCODE
+        Write-Log "Uninstall exit code: $unExit" "INFO"
+        Write-Log ("Uninstall output:`n{0}" -f (($unOut | Out-String).Trim())) "INFO"
+        Write-WinGetCodeInfo -Code $unExit
+
+        $inOut = & $winget install --id $AppToDetect -e -s winget --version $ExpectedVersion --scope machine --silent --disable-interactivity --accept-source-agreements --accept-package-agreements 2>&1
+        $inExit = $LASTEXITCODE
+        Write-Log "Install pinned version exit code: $inExit" "INFO"
+        Write-Log ("Install output:`n{0}" -f (($inOut | Out-String).Trim())) "INFO"
+        Write-WinGetCodeInfo -Code $inExit
+
+        # Final check
+        $finalList = & $winget list --id $AppToDetect -e -s winget --accept-source-agreements 2>&1
+        $finalExit = $LASTEXITCODE
+        $finalVersion = $null
+        if ($finalExit -eq 0 -and $finalList) {
+            foreach ($line in $finalList) {
+                if ($line -match [regex]::Escape($AppToDetect)) {
+                    $tokens = $line -split '\s+'
+                    $idIndex = [Array]::IndexOf($tokens, $AppToDetect)
+                    if ($idIndex -ge 0 -and ($idIndex + 1) -lt $tokens.Length) {
+                        $finalVersion = $tokens[$idIndex + 1]
+                    }
+                    break
+                }
+            }
+        }
+
+        if ($finalVersion -eq $ExpectedVersion) {
+            Write-Log "Pinned version enforced successfully → DETECTED." "INFO"
+            $DetectionResultCode = 2005
+            "Detected: Code 2005 (pinned version enforced)"
+            $global:LASTEXITCODE = 0
+            exit 0
+        }
+
+        Write-Log "Pinned version enforcement failed. Expected '$ExpectedVersion', got '$finalVersion'." "ERROR"
+        $DetectionResultCode = 2007
+        $global:LASTEXITCODE = 1
+        "NotDetected: Code 2007 (version mismatch)"
+        exit 1
+    }
+
+    # If we reach here, app is installed; proceed to upgrade check
+    # If installed, optionally check if an upgrade is available (informational only)
     try {
-        Write-Log "Running 'winget upgrade' for '$AppToDetect'." "INFO"
-                $upgOut = & $winget upgrade --id $AppToDetect -e -s winget --accept-source-agreements --accept-package-agreements 2>&1
+        Write-Log "Running 'winget upgrade' for '$AppToDetect' (informational only)." "INFO"
+        $upgOut = & $winget upgrade --id $AppToDetect -e -s winget --silent --disable-interactivity --accept-source-agreements --accept-package-agreements 2>&1
         $upgExit = $LASTEXITCODE
         Write-Log "'winget upgrade' exit code: $upgExit" "INFO"
         Write-Log ("'winget upgrade' output:`n{0}" -f (($upgOut | Out-String).Trim())) "INFO"
         Write-WinGetCodeInfo -Code $upgExit
-    }
-    catch {
-        # If upgrade check fails, we treat as unknown error
-        Write-Log "Error running 'winget upgrade': $($_.Exception.Message)" "ERROR"
-        $DetectionResultCode = 2002
-        $global:LASTEXITCODE = 1
-        "NotDetected: Code 2002 (winget upgrade failed)"
-        exit 1
-    }
-
-    $upgradeAvailable = $false
-    if ($upgOut) {
-        foreach ($line in $upgOut) {
-            if ($line -match [regex]::Escape($AppToDetect)) {
-                $upgradeAvailable = $true
-                break
+        if ($upgExit -eq 0) {
+            $upgradeAvailable = $false
+            if ($upgOut) {
+                foreach ($line in $upgOut) {
+                    if ($line -match [regex]::Escape($AppToDetect)) {
+                        $upgradeAvailable = $true
+                        break
+                    }
+                }
+            }
+            if ($upgradeAvailable) {
+                Write-Log "'$AppToDetect' appears to have an upgrade available (informational only, detection remains SUCCESS)." "WARN"
             }
         }
     }
-
-    if ($upgradeAvailable) {
-        Write-Log "'$AppToDetect' has an upgrade available → NOT COMPLIANT (but installed)." "WARN"
-        $DetectionResultCode = 2004
-        $global:LASTEXITCODE = 1
-        "NotDetected: Code 2004 (upgrade available)"
-        exit 1
+    catch {
+        Write-Log "Error running 'winget upgrade' (informational): $($_.Exception.Message)" "WARN"
     }
 
-    # Otherwise, installed and up to date
-    Write-Log "'$AppToDetect' installed and up to date → DETECTED." "INFO"
+    # At this point we know the app is installed; detection is SUCCESS regardless of upgrade availability
+    Write-Log "'$AppToDetect' installed → DETECTED." "INFO"
     $DetectionResultCode = 2005
-    "Detected: Code 2005 (installed & up to date)"
+    "Detected: Code 2005 (installed)"
     $global:LASTEXITCODE = 0
     exit 0
 }

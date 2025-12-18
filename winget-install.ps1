@@ -243,6 +243,91 @@ try {
         else {
             Write-Log "Installing/upgrading '$AppId' (raw: '$AppRaw')."
 
+            # Determine if a specific version is pinned via --version <x> in extra args
+            $pinnedVersion = $null
+            for ($i = 0; $i -lt $extraArgs.Count; $i++) {
+                if ($extraArgs[$i] -eq "--version" -and ($i + 1) -lt $extraArgs.Count) {
+                    $pinnedVersion = $extraArgs[$i + 1]
+                    break
+                }
+            }
+
+            # If no pinned version, try to upgrade if the app is already installed
+            $didUpgradeAttempt = $false
+            $upgradeSucceeded  = $false
+            if (-not $pinnedVersion) {
+                try {
+                    Write-Log "Checking if '$AppId' is already installed via winget list." "INFO"
+                    $listOut = & $winget list --id $AppId -e -s winget --accept-source-agreements 2>&1
+                    $listExit = $LASTEXITCODE
+                    Write-Log "winget list exit code: $listExit" "INFO"
+                    Write-Log ("winget list output:`n{0}" -f (($listOut | Out-String).Trim())) "INFO"
+                    Write-WinGetCodeInfo -Code $listExit
+
+                    $isInstalled = $false
+                    if ($listExit -eq 0) {
+                        foreach ($ln in $listOut) {
+                            if ($ln -match [regex]::Escape($AppId)) { $isInstalled = $true; break }
+                        }
+                    }
+                    elseif ($listExit -eq -1978335212) {
+                        # No installed package found matching input criteria
+                        $isInstalled = $false
+                    }
+
+                    if ($isInstalled) {
+                        $didUpgradeAttempt = $true
+                        Write-Log "App appears installed. Attempting winget upgrade for '$AppId'." "INFO"
+                        $upArgs = @(
+                            "upgrade",
+                            "--id", $AppId,
+                            "-e",
+                            "--silent",
+                            "--disable-interactivity",
+                            "--accept-source-agreements",
+                            "--accept-package-agreements",
+                            "-s", "winget"
+                        )
+                        if ($extraArgs.Count -gt 0) {
+                            $upArgs += $extraArgs
+                        }
+                        Write-Log ("Executing: winget {0}" -f ($upArgs -join " ")) "INFO"
+                        $upOut = & $winget @upArgs 2>&1
+                        $upExit = $LASTEXITCODE
+                        Write-Log ("winget upgrade output:`n{0}" -f (($upOut | Out-String).Trim())) "INFO"
+                        Write-Log "Raw winget Upgrade exit code: $upExit" "INFO"
+                        Write-WinGetCodeInfo -Code $upExit
+
+                        if ($upExit -eq 0 -or $upExit -eq -1978335189) {
+                            # 0 = success; -1978335189 = update not applicable (treat as success)
+                            $upgradeSucceeded = $true
+                            Write-Log "Upgrade step considered successful for '$AppId' (exit $upExit)." "INFO"
+                            # Map to success for Intune
+                            Set-ExitCode -Code 0 -AppId $AppId -Phase "Upgrade"
+                        }
+                        else {
+                            Write-Log "Upgrade step failed for '$AppId' (exit $upExit). Will fall back to install." "WARN"
+                        }
+                    }
+                }
+                catch {
+                    Write-Log "Exception during upgrade pre-check/attempt: $($_.Exception.Message)" "WARN"
+                }
+            }
+
+            if ($didUpgradeAttempt -and $upgradeSucceeded) {
+                # Upgrade succeeded (or not applicable); skip install phase
+                # Run optional per-app mod script after upgrade, same as after install
+                $modsPath = Join-Path $PSScriptRoot "mods"
+                $modFile  = Join-Path $modsPath ($AppId + ".ps1")
+                if (Test-Path $modFile) {
+                    Write-Log "Running mod script '$modFile' after upgrade." "INFO"
+                    try { . $modFile } catch {
+                        Write-Log "Mod script failed after upgrade: $($_.Exception.Message)" "ERROR"
+                    }
+                }
+                continue
+            }
             $args = @(
                 "install",
                 "--id", $AppId,
@@ -265,6 +350,38 @@ try {
 
             Write-Log ($out | Out-String).Trim()
             Write-Log "Raw winget Install exit code: $rawExit"
+            Write-WinGetCodeInfo -Code $rawExit
+            # Upgrade support: if another version is already installed and no pinned version is specified, run winget upgrade.
+            $isPinned = $false
+            if ($extraArgs -and ($extraArgs -contains "--version")) { $isPinned = $true }
+            if (-not $isPinned -and $rawExit -eq -1978334963) {
+                Write-Log "Install reported another version already installed; attempting winget upgrade for $AppId." "WARN"
+                $upgArgs = @("upgrade","--id",$AppId,"-e","-s","winget","--silent","--disable-interactivity","--accept-source-agreements","--accept-package-agreements")
+                $upgOut2 = & $winget @upgArgs 2>&1
+                $upgExit2 = $LASTEXITCODE
+                Write-Log "winget upgrade exit code: $upgExit2" "INFO"
+                Write-Log ("winget upgrade output:`n{0}" -f (($upgOut2 | Out-String).Trim())) "INFO"
+                Write-WinGetCodeInfo -Code $upgExit2
+                if ($upgExit2 -in @(0, -1978335189)) {
+                    Write-Log "Upgrade completed (or not applicable). Treating as success." "INFO"
+                    $rawExit = 0
+                }
+            }
+            # Pinned version enforcement: if higher/other version installed, uninstall then install to enforce pinned version.
+            if ($isPinned -and $rawExit -in @(-1978334962, -1978334963)) {
+                Write-Log "Pinned version requested but different/higher version installed; enforcing by uninstall+install." "WARN"
+                $unArgs2 = @("uninstall","--id",$AppId,"-e","-s","winget","--silent","--disable-interactivity","--accept-source-agreements","--accept-package-agreements")
+                $unOut2 = & $winget @unArgs2 2>&1
+                $unExit2 = $LASTEXITCODE
+                Write-Log "winget uninstall exit code: $unExit2" "INFO"
+                Write-Log ("winget uninstall output:`n{0}" -f (($unOut2 | Out-String).Trim())) "INFO"
+                Write-WinGetCodeInfo -Code $unExit2
+                $installOut2 = & $winget @args 2>&1
+                $rawExit = $LASTEXITCODE
+                Write-Log "Retried winget install exit code: $rawExit" "INFO"
+                Write-Log ("Retried winget install output:`n{0}" -f (($installOut2 | Out-String).Trim())) "INFO"
+                Write-WinGetCodeInfo -Code $rawExit
+            }
             Write-WinGetCodeInfo -Code $rawExit
 
             $mappedExit = Map-InstallerExitCode -RawExit $rawExit
