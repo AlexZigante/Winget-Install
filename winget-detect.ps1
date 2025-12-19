@@ -1,4 +1,3 @@
-# Winget Detect - Autopilot Bootstrap v3 (Intune custom detection script)
 $AppToDetect = "PLACEHOLDER"
 $ExpectedVersion = "PLACEHOLDER_VERSION"
 
