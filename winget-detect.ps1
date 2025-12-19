@@ -2,6 +2,16 @@
 $AppToDetect = "PLACEHOLDER"
 $ExpectedVersion = "PLACEHOLDER_VERSION"
 
+
+# Safety: if the script is still a template (PLACEHOLDER not replaced), fail fast to avoid false folders/detections
+if ([string]::IsNullOrWhiteSpace($AppToDetect) -or $AppToDetect -eq "PLACEHOLDER") {
+    Write-Host "NotDetected: AppToDetect is not set (template placeholder)."
+    exit 1
+}
+if ($ExpectedVersion -eq "PLACEHOLDER_VERSION") {
+    $ExpectedVersion = ""
+}
+
 # Detection internal result codes (for logs only)
 # 2000 : Unknown detection error
 # 2001 : winget.exe not available (even after App Installer registration)
