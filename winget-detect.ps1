@@ -118,14 +118,16 @@ function Get-WingetPath {
     }
 
     # Try to register App Installer, which should provision winget
-    Write-Log "winget.exe not found, attempting to register App Installer (Microsoft.DesktopAppInstaller_8wekyb3d8bbwe)..." "WARN"
+    Write-Log "winget.exe not found, attempting to Install Desktop App Installer (Microsoft.DesktopAppInstaller_8wekyb3d8bbwe)..." "WARN"
 
     try {
-        Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
+        Invoke-WebRequest -Uri https://aka.ms/getwinget -OutFile winget.msixbundle
+        Add-AppxPackage winget.msixbundle -ErrorAction Stop
+        del winget.msixbundle
         Write-Log "App Installer registration completed, re-checking for winget.exe." "INFO"
     }
     catch {
-        Write-Log "Failed to register App Installer: $($_.Exception.Message)" "ERROR"
+        Write-Log "Failed to Install Desktop App Installer: $($_.Exception.Message)" "ERROR"
     }
 
     # Re-try PATH
