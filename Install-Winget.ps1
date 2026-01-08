@@ -1,13 +1,13 @@
 <#
 Install-Winget.ps1
 Purpose:
-  - Install/repair WinGet (Microsoft.DesktopAppInstaller) in SYSTEM context, then initialize sources.
+  - Install/repair WinGet (Microsoft.DesktopAppInstaller) in USER context, then initialize sources.
   - Used as the install command for the Intune Win32 app: "WinGet Dependency for WIP".
 
 Behavior:
   1) Try default registration by family name (fast)
   2) Try Microsoft.WinGet.Client + Repair-WinGetPackageManager (Sandbox-style bootstrap)
-  3) Fallback to SYSTEM bootstrap: download App Installer + dependencies and install with Add-AppxPackage
+  3) Fallback to bootstrap: download App Installer + dependencies and install with Add-AppxPackage
   After each method (when winget becomes available), run:
     winget source reset --force
     winget source update
@@ -31,13 +31,29 @@ function Write-Log {
     try { Add-Content -Path $Global:LogFile -Value $line } catch {}
 }
 
+
+function Get-LogRoot {
+    $primary = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\WinGetDependencyForWIP"
+    try {
+        if (-not (Test-Path $primary)) { New-Item -ItemType Directory -Path $primary -Force -ErrorAction Stop | Out-Null }
+        $testFile = Join-Path $primary ".__wip_write_test"
+        "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
+        Remove-Item -Path $testFile -Force -ErrorAction SilentlyContinue
+        return $primary
+    } catch {
+        $fallback = Join-Path $env:LOCALAPPDATA "Microsoft\IntuneManagementExtension\Logs\WinGetDependencyForWIP"
+        if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
+        return $fallback
+    }
+}
+
 function Initialize-LogFile {
-    $root = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\WinGetDependencyForWIP"
-    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+    $root = Get-LogRoot
     $ts = Get-Date -Format "yyyyMMdd_HHmmss"
     $Global:LogFile = Join-Path $root ("Install_{0}.log" -f $ts)
 }
 Initialize-LogFile
+
 Write-Log "========== Install-Winget starting =========="
 
 # --- Helpers ---
@@ -49,13 +65,26 @@ function Set-Tls {
     } catch {}
 }
 
+
 function Get-WinGetExePath {
-    # Fast path: Desktop App Installer folders in WindowsApps
-    $progApps = "C:\Program Files\WindowsApps"
-    if (Test-Path $progApps) {
+    # User-context focused resolution (App Execution Alias + per-user WindowsApps).
+    # Returns full path to winget.exe, or $null.
+
+    # 1) PATH / AppExecutionAlias
+    try {
+        $cmd = Get-Command -Name 'winget.exe' -ErrorAction Stop
+        if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    } catch {}
+
+    # 2) Per-user WindowsApps
+    $wa = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+    if (Test-Path $wa) {
+        $direct = Join-Path $wa "winget.exe"
+        if (Test-Path $direct) { return $direct }
+
         try {
-            $daiDirs = Get-ChildItem -Path $progApps -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like "Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe" } |
+            $daiDirs = Get-ChildItem -Path $wa -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "Microsoft.Desktop.AppInstaller_*" -or $_.Name -like "Microsoft.DesktopAppInstaller_*" } |
                 Sort-Object -Property Name -Descending
             foreach ($d in $daiDirs) {
                 $p = Join-Path $d.FullName 'winget.exe'
@@ -64,14 +93,8 @@ function Get-WinGetExePath {
         } catch {}
     }
 
-    # PATH / alias
-    try {
-        $cmd = Get-Command -Name 'winget.exe' -ErrorAction Stop
-        if ($cmd -and $cmd.Source) { return $cmd.Source }
-    } catch {}
-
+    # 3) Default profile aliases (rare)
     $alias = @(
-        (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"),
         "C:\Users\Default\AppData\Local\Microsoft\WindowsApps\winget.exe",
         "C:\Users\defaultuser0\AppData\Local\Microsoft\WindowsApps\winget.exe"
     )
@@ -79,6 +102,7 @@ function Get-WinGetExePath {
 
     return $null
 }
+
 
 function Initialize-WinGetSources {
     param([Parameter(Mandatory)][string]$WingetPath)
@@ -125,7 +149,7 @@ function Try-DefaultRegister {
 
 # --- Method 2: Microsoft.WinGet.Client + Repair-WinGetPackageManager ---
 function Try-RepairCmdlet {
-    Write-Log "Method 2/3: Microsoft.WinGet.Client + Repair-WinGetPackageManager -AllUsers." "INFO"
+    Write-Log "Method 2/3: Microsoft.WinGet.Client + Repair-WinGetPackageManager (CurrentUser)." "INFO"
     try {
         Set-Tls
         try {
@@ -135,8 +159,8 @@ function Try-RepairCmdlet {
         }
 
         try {
-            # Force AllUsers to avoid user-profile scope in SYSTEM context
-            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope AllUsers -ErrorAction Stop | Out-Null
+            # Force AllUsers to avoid user-profile scope in USER context
+            Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope CurrentUser -ErrorAction Stop | Out-Null
         } catch {
             # If PSGallery is blocked, this will fail; log and continue to method 3
             Write-Log "Install-Module Microsoft.WinGet.Client failed: $($_.Exception.Message)" "WARN"
@@ -151,7 +175,12 @@ function Try-RepairCmdlet {
         }
 
         try {
-            Repair-WinGetPackageManager -AllUsers -ErrorAction Stop | Out-Null
+            $repairCmd = Get-Command -Name Repair-WinGetPackageManager -ErrorAction Stop
+            if ($repairCmd.Parameters.ContainsKey("AllUsers")) {
+                Repair-WinGetPackageManager -AllUsers -ErrorAction Stop | Out-Null
+            } else {
+                Repair-WinGetPackageManager -ErrorAction Stop | Out-Null
+            }
             Write-Log "Repair-WinGetPackageManager completed." "INFO"
             return $true
         } catch {
@@ -164,7 +193,7 @@ function Try-RepairCmdlet {
     }
 }
 
-# --- Method 3: SYSTEM bootstrap (download + Add-AppxPackage) ---
+# --- Method 3: bootstrap (download + Add-AppxPackage) ---
 $Uri_AppInstaller = 'https://aka.ms/getwinget'
 $Uri_VCLibs       = 'https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx'
 $Uri_UIXaml       = 'https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx'
@@ -173,7 +202,7 @@ $Name_AppInstaller = 'Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle'
 $Name_VCLibs       = 'Microsoft.VCLibs.x64.14.00.Desktop.appx'
 $Name_UIXaml       = 'Microsoft.UI.Xaml.2.8.x64.appx'
 
-$CacheDir = Join-Path $env:ProgramData "WinGetDependencyForWIP\cache"
+$CacheDir = Join-Path $env:LOCALAPPDATA "WinGetDependencyForWIP\cache"
 if (-not (Test-Path $CacheDir)) { New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null }
 
 function Invoke-DownloadFile {
@@ -214,7 +243,7 @@ function Install-AppxFromPath {
 }
 
 function Try-SystemBootstrap {
-    Write-Log "Method 3/3: SYSTEM bootstrap (download App Installer + deps, Add-AppxPackage)." "INFO"
+    Write-Log "Method 3/3: bootstrap (download App Installer + deps, Add-AppxPackage)." "INFO"
     try {
         $pathAppInstaller = Resolve-Or-DownloadPayload -FileName $Name_AppInstaller -Uri $Uri_AppInstaller
         $pathVCLibs       = Resolve-Or-DownloadPayload -FileName $Name_VCLibs       -Uri $Uri_VCLibs
@@ -227,10 +256,10 @@ function Try-SystemBootstrap {
         # Install App Installer bundle (winget)
         Install-AppxFromPath -Path $pathAppInstaller
 
-        Write-Log "SYSTEM bootstrap installation attempted." "INFO"
+        Write-Log "bootstrap installation attempted." "INFO"
         return $true
     } catch {
-        Write-Log "SYSTEM bootstrap failed: $($_.Exception.Message)" "WARN"
+        Write-Log "bootstrap failed: $($_.Exception.Message)" "WARN"
         return $false
     }
 }

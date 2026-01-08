@@ -1,8 +1,8 @@
 <#
 Detect-Winget.ps1
 Purpose:
-  - Detect whether WinGet is available and functional for SYSTEM context.
-  - Used as the detection script for the Intune Win32 app: "WinGet Dependency for WIP".
+  - Detect whether WinGet is available and functional for USER context (first user login).
+  - Used as the detection script for the Intune Win32 app: "WinGet Dependency for WIP" (Install experience: User).
 #>
 
 [CmdletBinding()]
@@ -22,22 +22,54 @@ function Write-Log {
     try { Add-Content -Path $Global:LogFile -Value $line } catch {}
 }
 
+
+function Get-LogRoot {
+    $primary = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\WinGetDependencyForWIP"
+    try {
+        if (-not (Test-Path $primary)) { New-Item -ItemType Directory -Path $primary -Force -ErrorAction Stop | Out-Null }
+        # quick write test (ProgramData can be read-only for user context on some devices)
+        $testFile = Join-Path $primary ".__wip_write_test"
+        "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
+        Remove-Item -Path $testFile -Force -ErrorAction SilentlyContinue
+        return $primary
+    } catch {
+        $fallback = Join-Path $env:LOCALAPPDATA "Microsoft\IntuneManagementExtension\Logs\WinGetDependencyForWIP"
+        if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
+        return $fallback
+    }
+}
+
 function Initialize-LogFile {
-    $root = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\WinGetDependencyForWIP"
-    if (-not (Test-Path $root)) { New-Item -ItemType Directory -Path $root -Force | Out-Null }
+    $root = Get-LogRoot
     $ts = Get-Date -Format "yyyyMMdd_HHmmss"
     $Global:LogFile = Join-Path $root ("Detect_{0}.log" -f $ts)
 }
 Initialize-LogFile
+
 Write-Log "========== Detect-Winget starting =========="
 
+
 function Get-WinGetExePath {
-    $progApps = "C:\Program Files\WindowsApps"
-    if (Test-Path $progApps) {
+    # User-context focused resolution (App Execution Alias + per-user WindowsApps).
+    # Returns full path to winget.exe, or $null.
+
+    # 1) PATH / AppExecutionAlias
+    try {
+        $cmd = Get-Command -Name 'winget.exe' -ErrorAction Stop
+        if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) { return $cmd.Source }
+    } catch {}
+
+    # 2) Per-user WindowsApps
+    $wa = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+    if (Test-Path $wa) {
+        $direct = Join-Path $wa "winget.exe"
+        if (Test-Path $direct) { return $direct }
+
         try {
-            $daiDirs = Get-ChildItem -Path $progApps -Directory -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -like "Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe" } |
+            $daiDirs = Get-ChildItem -Path $wa -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "Microsoft.Desktop.AppInstaller_*" -or $_.Name -like "Microsoft.DesktopAppInstaller_*" } |
                 Sort-Object -Property Name -Descending
+
             foreach ($d in $daiDirs) {
                 $p = Join-Path $d.FullName 'winget.exe'
                 if (Test-Path $p) { return $p }
@@ -45,13 +77,8 @@ function Get-WinGetExePath {
         } catch {}
     }
 
-    try {
-        $cmd = Get-Command -Name 'winget.exe' -ErrorAction Stop
-        if ($cmd -and $cmd.Source) { return $cmd.Source }
-    } catch {}
-
+    # 3) Default profile aliases (rare)
     $alias = @(
-        (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"),
         "C:\Users\Default\AppData\Local\Microsoft\WindowsApps\winget.exe",
         "C:\Users\defaultuser0\AppData\Local\Microsoft\WindowsApps\winget.exe"
     )
@@ -59,6 +86,7 @@ function Get-WinGetExePath {
 
     return $null
 }
+
 
 function Initialize-WinGetSources {
     param([Parameter(Mandatory)][string]$WingetPath)

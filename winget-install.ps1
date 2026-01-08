@@ -36,7 +36,25 @@ function Write-Log {
     )
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[{0}] [{1}] {2}" -f $timestamp, $Level, $Message
+    $line = "[{0}
+
+function Get-IMELogRoot {
+    # Prefer ProgramData (visible in IME logs), but fall back to per-user log path when running in user context.
+    $primary = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    try {
+        if (-not (Test-Path $primary)) { New-Item -ItemType Directory -Path $primary -Force -ErrorAction Stop | Out-Null }
+        $testFile = Join-Path $primary ".__wip_write_test"
+        "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
+        Remove-Item -Path $testFile -Force -ErrorAction SilentlyContinue
+        return $primary
+    } catch {
+        $fallback = Join-Path $env:LOCALAPPDATA "Microsoft\IntuneManagementExtension\Logs"
+        if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
+        return $fallback
+    }
+}
+
+] [{1}] {2}" -f $timestamp, $Level, $Message
     Write-Host $line
     try {
         Add-Content -Path $Global:LogFile -Value $line
@@ -52,10 +70,7 @@ function Set-AppLogFile {
     )
 
     $safeName   = $AppId -replace '[^\w\.-]', '_'
-    $imeLogRoot = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
-    if (-not (Test-Path $imeLogRoot)) {
-        New-Item -ItemType Directory -Path $imeLogRoot -Force | Out-Null
-    }
+    $imeLogRoot = Get-IMELogRoot
     $logRoot = Join-Path $imeLogRoot $safeName
     if (-not (Test-Path $logRoot)) {
         New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
@@ -138,7 +153,26 @@ function Get-WingetPath {
         }
     }
 
-    # 3) WindowsApps (fast path: Desktop App Installer folders)
+    # 3) Per-user WindowsApps Desktop App Installer folder (common in Autopilot first-login)
+    $userWA = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+    if (Test-Path $userWA) {
+        try {
+            $daiDirsU = Get-ChildItem -Path $userWA -Directory -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like "Microsoft.Desktop.AppInstaller_*" -or $_.Name -like "Microsoft.DesktopAppInstaller_*" } |
+                Sort-Object -Property Name -Descending
+            foreach ($d in $daiDirsU) {
+                $candidateU = Join-Path $d.FullName "winget.exe"
+                if (Test-Path $candidateU) {
+                    Write-Log "winget.exe found in user WindowsApps DesktopAppInstaller folder: '$candidateU'." "INFO"
+                    return $candidateU
+                }
+            }
+        } catch {
+            Write-Log "Error while searching user WindowsApps for winget.exe: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # 4) WindowsApps (fast path: Desktop App Installer folders)
     $progApps = "C:\Program Files\WindowsApps"
     if (Test-Path $progApps) {
         try {
@@ -189,14 +223,14 @@ try {
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'."
-        Write-Log "Refreshing WinGet sources via 'winget upgrade --accept-source-agreements'." "INFO"
+        Write-Log "Refreshing WinGet sources (reset + update) before running package operations." "INFO"
         try {
-            $null = & $winget source reset --force --accept-source-agreements 2>&1
-            $null = & $winget source update --accept-source-agreements 2>&1
-            $null = & $winget upgrade --accept-source-agreements 2>&1
+            $null = & $winget source reset --force --disable-interactivity --accept-source-agreements 2>&1
+            $null = & $winget source update --disable-interactivity --accept-source-agreements 2>&1
+            # (skipped) winget upgrade is intentionally not called during Autopilot/first-login
         }
         catch {
-            Write-Log "Source refresh via 'winget upgrade' failed: $($_.Exception.Message)" "WARN"
+            Write-Log "Source refresh (source reset/update) failed: $($_.Exception.Message)" "WARN"
         }
     }
     catch {
