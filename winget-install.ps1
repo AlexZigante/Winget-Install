@@ -27,6 +27,49 @@ function Write-WinGetCodeInfo {
     }
 }
 
+
+function Get-IMELogRoot {
+    # Prefer ProgramData (visible in IME logs), but fall back to per-user log path when running in user context.
+    $primary = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
+    try {
+        if (-not (Test-Path $primary)) {
+            New-Item -ItemType Directory -Path $primary -Force -ErrorAction Stop | Out-Null
+        }
+        # quick write test (ProgramData can be read-only for user context on some devices)
+        $testFile = Join-Path $primary ".__wip_write_test"
+        "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
+        Remove-Item -Path $testFile -Force -ErrorAction SilentlyContinue
+        return $primary
+    } catch {
+        $fallback = Join-Path $env:LOCALAPPDATA "Microsoft\IntuneManagementExtension\Logs"
+        try {
+            if (-not (Test-Path $fallback)) {
+                New-Item -ItemType Directory -Path $fallback -Force -ErrorAction Stop | Out-Null
+            }
+        } catch {
+            # Last resort: TEMP (should be writable)
+            $fallback = Join-Path $env:TEMP "Microsoft\IntuneManagementExtension\Logs"
+            if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
+        }
+        return $fallback
+    }
+}
+
+function Initialize-GlobalLogFile {
+    # Create a general run log before per-app log files are created.
+    $root = Get-IMELogRoot
+    $runDir = Join-Path $root "Winget-Install"
+    try {
+        if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force -ErrorAction Stop | Out-Null }
+    } catch {
+        # If even this fails, fall back to TEMP
+        $runDir = Join-Path $env:TEMP "Winget-Install"
+        if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir -Force | Out-Null }
+    }
+    $ts = Get-Date -Format "yyyyMMdd_HHmmss"
+    $Global:LogFile = Join-Path $runDir ("Run_{0}.log" -f $ts)
+}
+
 function Write-Log {
     param(
         [Parameter(Mandatory=$true)]
@@ -36,32 +79,17 @@ function Write-Log {
     )
 
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $line = "[{0}
-
-function Get-IMELogRoot {
-    # Prefer ProgramData (visible in IME logs), but fall back to per-user log path when running in user context.
-    $primary = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
-    try {
-        if (-not (Test-Path $primary)) { New-Item -ItemType Directory -Path $primary -Force -ErrorAction Stop | Out-Null }
-        $testFile = Join-Path $primary ".__wip_write_test"
-        "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
-        Remove-Item -Path $testFile -Force -ErrorAction SilentlyContinue
-        return $primary
-    } catch {
-        $fallback = Join-Path $env:LOCALAPPDATA "Microsoft\IntuneManagementExtension\Logs"
-        if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
-        return $fallback
-    }
-}
-
-] [{1}] {2}" -f $timestamp, $Level, $Message
+    $line = "[{0}] [{1}] {2}" -f $timestamp, $Level, $Message
     Write-Host $line
     try {
-        Add-Content -Path $Global:LogFile -Value $line
-    }
-    catch {
+        if ($Global:LogFile) {
+            Add-Content -Path $Global:LogFile -Value $line -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # Never fail the script due to logging
     }
 }
+
 function Set-AppLogFile {
     param(
         [Parameter(Mandatory=$true)]
@@ -69,11 +97,18 @@ function Set-AppLogFile {
         [switch]$Uninstall
     )
 
-    $safeName   = $AppId -replace '[^\w\.-]', '_'
+    $safeName   = $AppId -replace '[^\\w\\.-]', '_'
     $imeLogRoot = Get-IMELogRoot
-    $logRoot = Join-Path $imeLogRoot $safeName
-    if (-not (Test-Path $logRoot)) {
-        New-Item -ItemType Directory -Path $logRoot -Force | Out-Null
+    $logRoot    = Join-Path $imeLogRoot $safeName
+
+    try {
+        if (-not (Test-Path $logRoot)) {
+            New-Item -ItemType Directory -Path $logRoot -Force -ErrorAction Stop | Out-Null
+        }
+    } catch {
+        # Fallback to TEMP if per-app folder cannot be created
+        $logRoot = Join-Path $env:TEMP $safeName
+        if (-not (Test-Path $logRoot)) { New-Item -ItemType Directory -Path $logRoot -Force | Out-Null }
     }
 
     $ts     = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -81,13 +116,7 @@ function Set-AppLogFile {
     $Global:LogFile = Join-Path $logRoot ("{0}_{1}.log" -f $prefix, $ts)
 }
 
-
-try {
-}
-catch {
-    Write-Log "Failed to start transcript: $($_.Exception.Message)" "WARN"
-}
-
+Initialize-GlobalLogFile
 function Map-InstallerExitCode {
     param(
         [Parameter(Mandatory=$true)]

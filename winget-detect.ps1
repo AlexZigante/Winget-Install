@@ -45,16 +45,28 @@ function Write-WinGetCodeInfo {
 $logDirName = $AppToDetect -replace '[^\w\.-]', '_'
 
 function Get-IMELogRoot {
+    # Prefer ProgramData (visible in IME logs), but fall back to per-user log path when running in user context.
     $primary = "C:\ProgramData\Microsoft\IntuneManagementExtension\Logs"
     try {
-        if (-not (Test-Path $primary)) { New-Item -ItemType Directory -Path $primary -Force -ErrorAction Stop | Out-Null }
+        if (-not (Test-Path $primary)) {
+            New-Item -ItemType Directory -Path $primary -Force -ErrorAction Stop | Out-Null
+        }
+        # quick write test (ProgramData can be read-only for user context on some devices)
         $testFile = Join-Path $primary ".__wip_write_test"
         "test" | Out-File -FilePath $testFile -Force -ErrorAction Stop
         Remove-Item -Path $testFile -Force -ErrorAction SilentlyContinue
         return $primary
     } catch {
         $fallback = Join-Path $env:LOCALAPPDATA "Microsoft\IntuneManagementExtension\Logs"
-        if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
+        try {
+            if (-not (Test-Path $fallback)) {
+                New-Item -ItemType Directory -Path $fallback -Force -ErrorAction Stop | Out-Null
+            }
+        } catch {
+            # Last resort: TEMP (should be writable)
+            $fallback = Join-Path $env:TEMP "Microsoft\IntuneManagementExtension\Logs"
+            if (-not (Test-Path $fallback)) { New-Item -ItemType Directory -Path $fallback -Force | Out-Null }
+        }
         return $fallback
     }
 }
