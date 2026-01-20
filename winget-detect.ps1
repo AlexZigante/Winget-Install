@@ -197,14 +197,13 @@ try {
     try {
         $winget = Get-WingetPath
         Write-Log "Using winget at '$winget'." "INFO"
-        Write-Log "Refreshing WinGet sources (reset + update) before running detection." "INFO"
+        Write-Log "Refreshing WinGet sources (update) before running detection." "INFO"
         try {
-            $null = & $winget source reset --force --disable-interactivity --accept-source-agreements 2>&1
-            $null = & $winget source update --disable-interactivity --accept-source-agreements 2>&1
+            $null = & $winget source update --disable-interactivity 2>&1
             # (skipped) winget upgrade is intentionally not called during pre-detect source refresh
         }
         catch {
-            Write-Log "Source refresh (source reset/update) failed: $($_.Exception.Message)" "WARN"
+            Write-Log "Source refresh (source update) failed: $($_.Exception.Message)" "WARN"
         }
     }
     catch {
